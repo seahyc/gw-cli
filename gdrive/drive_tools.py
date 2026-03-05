@@ -1195,6 +1195,20 @@ async def export_drive_file(
         f"[export_drive_file] Invoked. Email: '{user_google_email}', File ID: '{file_id}', Target MIME: '{mime_type}'"
     )
 
+    # Map short format names to full MIME types
+    mime_shortcuts = {
+        "pdf": "application/pdf",
+        "txt": "text/plain",
+        "csv": "text/csv",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "html": "text/html",
+        "rtf": "application/rtf",
+        "epub": "application/epub+zip",
+    }
+    mime_type = mime_shortcuts.get(mime_type.lower(), mime_type)
+
     resolved_file_id, file_metadata = await resolve_drive_item(
         service, file_id, extra_fields="name, parents"
     )

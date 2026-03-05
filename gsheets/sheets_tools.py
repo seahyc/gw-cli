@@ -1717,12 +1717,13 @@ async def find_replace_sheet(
         "matchCase": match_case,
         "matchEntireCell": match_entire_cell,
         "searchByRegex": search_by_regex,
-        "allSheets": sheet_name is None,
     }
 
     if sheet_name is not None:
         sheet_id = await _get_sheet_id_by_name(service, file_id, sheet_name)
         find_replace_req["sheetId"] = sheet_id
+    else:
+        find_replace_req["allSheets"] = True
 
     request_body = {"requests": [{"findReplace": find_replace_req}]}
 

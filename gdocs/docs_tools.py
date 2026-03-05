@@ -393,6 +393,10 @@ async def modify_doc_text(
             font_family,
             text_color,
             background_color,
+            strikethrough,
+            superscript,
+            subscript,
+            link_url,
         )
         if not is_valid:
             return f"Error: {error_msg}"
@@ -1242,8 +1246,18 @@ async def update_document_style(
             }
         })
 
-    # Handle default font via named style update on NORMAL_TEXT
+    # Handle default font by fetching doc length and applying updateTextStyle to full body
     if default_font_family is not None or default_font_size is not None:
+        # Get the document to find the body content length
+        doc = await asyncio.to_thread(
+            service.documents().get(documentId=file_id).execute
+        )
+        body_content = doc.get("body", {}).get("content", [])
+        if body_content:
+            end_index = body_content[-1].get("endIndex", 1)
+        else:
+            end_index = 1
+
         text_style = {}
         style_fields = []
         if default_font_family is not None:
@@ -1256,6 +1270,10 @@ async def update_document_style(
         requests.append({
             "updateTextStyle": {
                 "textStyle": text_style,
+                "range": {
+                    "startIndex": 1,
+                    "endIndex": end_index - 1,
+                },
                 "fields": ",".join(style_fields),
             }
         })
@@ -1398,7 +1416,6 @@ async def manage_table_structure(
     if action not in valid_actions:
         return f"Error: action must be one of {', '.join(valid_actions)}."
 
-    table_location = {"tableStartLocation": {"index": table_start_index}}
     requests = []
 
     if action == "insert_row":
@@ -1406,8 +1423,7 @@ async def manage_table_structure(
             return "Error: 'row_index' is required for insert_row action."
         requests.append({
             "insertTableRow": {
-                **table_location,
-                "cellLocation": {
+                "tableCellLocation": {
                     "tableStartLocation": {"index": table_start_index},
                     "rowIndex": row_index,
                     "columnIndex": 0,
@@ -1420,7 +1436,7 @@ async def manage_table_structure(
             return "Error: 'column_index' is required for insert_column action."
         requests.append({
             "insertTableColumn": {
-                "cellLocation": {
+                "tableCellLocation": {
                     "tableStartLocation": {"index": table_start_index},
                     "rowIndex": 0,
                     "columnIndex": column_index,
