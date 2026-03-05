@@ -47,29 +47,14 @@ UPLOAD_CHUNK_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB (Google recommended minimum)
 @require_google_service("drive", "drive_read")
 async def search_drive_files(
     service,
-    user_google_email: str,
-    query: str,
+    user_google_email: str = "",
+    query: str = "",
     page_size: int = 10,
     drive_id: Optional[str] = None,
     include_items_from_all_drives: bool = True,
     corpora: Optional[str] = None,
 ) -> str:
-    """
-    Searches for files and folders within a user's Google Drive, including shared drives.
-
-    Args:
-        user_google_email (str): The user's Google email address. Required.
-        query (str): The search query string. Supports Google Drive search operators.
-        page_size (int): The maximum number of files to return. Defaults to 10.
-        drive_id (Optional[str]): ID of the shared drive to search. If None, behavior depends on `corpora` and `include_items_from_all_drives`.
-        include_items_from_all_drives (bool): Whether shared drive items should be included in results. Defaults to True. This is effective when not specifying a `drive_id`.
-        corpora (Optional[str]): Bodies of items to query (e.g., 'user', 'domain', 'drive', 'allDrives').
-                                 If 'drive_id' is specified and 'corpora' is None, it defaults to 'drive'.
-                                 Otherwise, Drive API default behavior applies. Prefer 'user' or 'drive' over 'allDrives' for efficiency.
-
-    Returns:
-        str: A formatted list of found files/folders with their details (ID, name, type, size, modified time, link).
-    """
+    """Search for files/folders in Google Drive. Supports Drive query operators or free text. Set drive_id for shared drives; prefer corpora='user' or 'drive' over 'allDrives'."""
     logger.info(
         f"[search_drive_files] Invoked. Email: '{user_google_email}', Query: '{query}'"
     )
@@ -105,7 +90,7 @@ async def search_drive_files(
         return f"No files found for '{query}'."
 
     formatted_files_text_parts = [
-        f"Found {len(files)} files for {user_google_email} matching '{query}':"
+        f"Found {len(files)} files matching '{query}':"
     ]
     for item in files:
         size_str = f", Size: {item.get('size', 'N/A')}" if "size" in item else ""
@@ -121,24 +106,10 @@ async def search_drive_files(
 @require_google_service("drive", "drive_read")
 async def get_drive_file_content(
     service,
-    user_google_email: str,
-    file_id: str,
+    user_google_email: str = "",
+    file_id: str = "",
 ) -> str:
-    """
-    Retrieves the content of a specific Google Drive file by ID, supporting files in shared drives.
-
-    • Native Google Docs, Sheets, Slides → exported as text / CSV.
-    • Office files (.docx, .xlsx, .pptx) → unzipped & parsed with std-lib to
-      extract readable text.
-    • Any other file → downloaded; tries UTF-8 decode, else notes binary.
-
-    Args:
-        user_google_email: The user’s Google email address.
-        file_id: Drive file ID.
-
-    Returns:
-        str: The file content as plain text with metadata header.
-    """
+    """Retrieve file content by ID. Native Google files exported as text/CSV; Office files parsed; others downloaded as UTF-8 or noted as binary."""
     logger.info(f"[get_drive_file_content] Invoked. File ID: '{file_id}'")
 
     resolved_file_id, file_metadata = await resolve_drive_item(
@@ -214,30 +185,11 @@ async def get_drive_file_content(
 @require_google_service("drive", "drive_read")
 async def get_drive_file_download_url(
     service,
-    user_google_email: str,
-    file_id: str,
+    user_google_email: str = "",
+    file_id: str = "",
     export_format: Optional[str] = None,
 ) -> str:
-    """
-    Gets a download URL for a Google Drive file. The file is prepared and made available via HTTP URL.
-
-    For Google native files (Docs, Sheets, Slides), exports to a useful format:
-    • Google Docs → PDF (default) or DOCX if export_format='docx'
-    • Google Sheets → XLSX (default) or CSV if export_format='csv'
-    • Google Slides → PDF (default) or PPTX if export_format='pptx'
-
-    For other files, downloads the original file format.
-
-    Args:
-        user_google_email: The user's Google email address. Required.
-        file_id: The Google Drive file ID to get a download URL for.
-        export_format: Optional export format for Google native files.
-                      Options: 'pdf', 'docx', 'xlsx', 'csv', 'pptx'.
-                      If not specified, uses sensible defaults (PDF for Docs/Slides, XLSX for Sheets).
-
-    Returns:
-        str: Download URL and file metadata. The file is available at the URL for 1 hour.
-    """
+    """Get a download URL for a Drive file. Native files auto-export (Docs/Slides->PDF, Sheets->XLSX). Override with export_format: pdf, docx, xlsx, csv, pptx."""
     logger.info(
         f"[get_drive_file_download_url] Invoked. File ID: '{file_id}', Export format: {export_format}"
     )
@@ -388,29 +340,14 @@ async def get_drive_file_download_url(
 @require_google_service("drive", "drive_read")
 async def list_drive_items(
     service,
-    user_google_email: str,
+    user_google_email: str = "",
     folder_id: str = "root",
     page_size: int = 100,
     drive_id: Optional[str] = None,
     include_items_from_all_drives: bool = True,
     corpora: Optional[str] = None,
 ) -> str:
-    """
-    Lists files and folders, supporting shared drives.
-    If `drive_id` is specified, lists items within that shared drive. `folder_id` is then relative to that drive (or use drive_id as folder_id for root).
-    If `drive_id` is not specified, lists items from user's "My Drive" and accessible shared drives (if `include_items_from_all_drives` is True).
-
-    Args:
-        user_google_email (str): The user's Google email address. Required.
-        folder_id (str): The ID of the Google Drive folder. Defaults to 'root'. For a shared drive, this can be the shared drive's ID to list its root, or a folder ID within that shared drive.
-        page_size (int): The maximum number of items to return. Defaults to 100.
-        drive_id (Optional[str]): ID of the shared drive. If provided, the listing is scoped to this drive.
-        include_items_from_all_drives (bool): Whether items from all accessible shared drives should be included if `drive_id` is not set. Defaults to True.
-        corpora (Optional[str]): Corpus to query ('user', 'drive', 'allDrives'). If `drive_id` is set and `corpora` is None, 'drive' is used. If None and no `drive_id`, API defaults apply.
-
-    Returns:
-        str: A formatted list of files/folders in the specified folder.
-    """
+    """List files/folders in a Drive folder. Set drive_id for shared drives. folder_id defaults to 'root'."""
     logger.info(
         f"[list_drive_items] Invoked. Email: '{user_google_email}', Folder ID: '{folder_id}'"
     )
@@ -432,7 +369,7 @@ async def list_drive_items(
         return f"No items found in folder '{folder_id}'."
 
     formatted_items_text_parts = [
-        f"Found {len(files)} items in folder '{folder_id}' for {user_google_email}:"
+        f"Found {len(files)} items in folder '{folder_id}':"
     ]
     for item in files:
         size_str = f", Size: {item.get('size', 'N/A')}" if "size" in item else ""
@@ -448,28 +385,14 @@ async def list_drive_items(
 @require_google_service("drive", "drive_file")
 async def create_drive_file(
     service,
-    user_google_email: str,
-    file_name: str,
-    content: Optional[str] = None,  # Now explicitly Optional
+    user_google_email: str = "",
+    file_name: str = "",
+    content: Optional[str] = None,
     folder_id: str = "root",
     mime_type: str = "text/plain",
-    fileUrl: Optional[str] = None,  # Now explicitly Optional
+    fileUrl: Optional[str] = None,
 ) -> str:
-    """
-    Creates a new file in Google Drive, supporting creation within shared drives.
-    Accepts either direct content or a fileUrl to fetch the content from.
-
-    Args:
-        user_google_email (str): The user's Google email address. Required.
-        file_name (str): The name for the new file.
-        content (Optional[str]): If provided, the content to write to the file.
-        folder_id (str): The ID of the parent folder. Defaults to 'root'. For shared drives, this must be a folder ID within the shared drive.
-        mime_type (str): The MIME type of the file. Defaults to 'text/plain'.
-        fileUrl (Optional[str]): If provided, fetches the file content from this URL. Supports file://, http://, and https:// protocols.
-
-    Returns:
-        str: Confirmation message of the successful file creation with file link.
-    """
+    """Create a file in Drive from content or fileUrl (file://, http://, https://). For shared drives, set folder_id to a folder within the drive."""
     logger.info(
         f"[create_drive_file] Invoked. Email: '{user_google_email}', File Name: {file_name}, Folder ID: {folder_id}, fileUrl: {fileUrl}"
     )
@@ -619,9 +542,9 @@ async def create_drive_file(
         )
 
     link = created_file.get("webViewLink", "No link available")
-    confirmation_message = f"Successfully created file '{created_file.get('name', file_name)}' (ID: {created_file.get('id', 'N/A')}) in folder '{folder_id}' for {user_google_email}. Link: {link}"
+    new_id = created_file.get("id", "N/A")
     logger.info(f"Successfully created file. Link: {link}")
-    return confirmation_message
+    return f"File created. ID: {new_id}\nLink: {link}"
 
 
 @server.tool()
@@ -631,21 +554,12 @@ async def create_drive_file(
 @require_google_service("drive", "drive_read")
 async def get_drive_file_permissions(
     service,
-    user_google_email: str,
-    file_id: str,
+    user_google_email: str = "",
+    file_id: str = "",
 ) -> str:
-    """
-    Gets detailed metadata about a Google Drive file including sharing permissions.
-
-    Args:
-        user_google_email (str): The user's Google email address. Required.
-        file_id (str): The ID of the file to check permissions for.
-
-    Returns:
-        str: Detailed file metadata including sharing status and URLs.
-    """
+    """Get detailed file metadata including sharing permissions and URLs."""
     logger.info(
-        f"[get_drive_file_permissions] Checking file {file_id} for {user_google_email}"
+        f"[get_drive_file_permissions] Checking file {file_id}"
     )
 
     resolved_file_id, _ = await resolve_drive_item(service, file_id)
@@ -740,19 +654,10 @@ async def get_drive_file_permissions(
 @require_google_service("drive", "drive_read")
 async def check_drive_file_public_access(
     service,
-    user_google_email: str,
-    file_name: str,
+    user_google_email: str = "",
+    file_name: str = "",
 ) -> str:
-    """
-    Searches for a file by name and checks if it has public link sharing enabled.
-
-    Args:
-        user_google_email (str): The user's Google email address. Required.
-        file_name (str): The name of the file to check.
-
-    Returns:
-        str: Information about the file's sharing status and whether it can be used in Google Docs.
-    """
+    """Search for a file by name and check if it has public link sharing enabled."""
     logger.info(f"[check_drive_file_public_access] Searching for {file_name}")
 
     # Search for the file
@@ -835,45 +740,21 @@ async def check_drive_file_public_access(
 @require_google_service("drive", "drive_file")
 async def update_drive_file(
     service,
-    user_google_email: str,
-    file_id: str,
-    # File metadata updates
+    user_google_email: str = "",
+    file_id: str = "",
     name: Optional[str] = None,
     description: Optional[str] = None,
     mime_type: Optional[str] = None,
-    # Folder organization
-    add_parents: Optional[str] = None,  # Comma-separated folder IDs to add
-    remove_parents: Optional[str] = None,  # Comma-separated folder IDs to remove
-    # File status
+    add_parents: Optional[str] = None,
+    remove_parents: Optional[str] = None,
     starred: Optional[bool] = None,
     trashed: Optional[bool] = None,
-    # Sharing and permissions
     writers_can_share: Optional[bool] = None,
     copy_requires_writer_permission: Optional[bool] = None,
-    # Custom properties
-    properties: Optional[dict] = None,  # User-visible custom properties
+    properties: Optional[dict] = None,
 ) -> str:
-    """
-    Updates metadata and properties of a Google Drive file.
-
-    Args:
-        user_google_email (str): The user's Google email address. Required.
-        file_id (str): The ID of the file to update. Required.
-        name (Optional[str]): New name for the file.
-        description (Optional[str]): New description for the file.
-        mime_type (Optional[str]): New MIME type (note: changing type may require content upload).
-        add_parents (Optional[str]): Comma-separated folder IDs to add as parents.
-        remove_parents (Optional[str]): Comma-separated folder IDs to remove from parents.
-        starred (Optional[bool]): Whether to star/unstar the file.
-        trashed (Optional[bool]): Whether to move file to/from trash.
-        writers_can_share (Optional[bool]): Whether editors can share the file.
-        copy_requires_writer_permission (Optional[bool]): Whether copying requires writer permission.
-        properties (Optional[dict]): Custom key-value properties for the file.
-
-    Returns:
-        str: Confirmation message with details of the updates applied.
-    """
-    logger.info(f"[update_drive_file] Updating file {file_id} for {user_google_email}")
+    """Update metadata/properties of a Drive file. Use add_parents/remove_parents (comma-separated IDs) to move between folders."""
+    logger.info(f"[update_drive_file] Updating file {file_id}")
 
     current_file_fields = (
         "name, description, mimeType, parents, starred, trashed, webViewLink, "
@@ -944,9 +825,8 @@ async def update_drive_file(
 
     # Build response message
     output_parts = [
-        f"✅ Successfully updated file: {updated_file.get('name', current_file['name'])}"
+        f"Updated file: {updated_file.get('name', current_file['name'])}"
     ]
-    output_parts.append(f"   File ID: {file_id}")
 
     # Report what changed
     changes = []
@@ -1001,9 +881,6 @@ async def update_drive_file(
     else:
         output_parts.append("   (No changes were made)")
 
-    output_parts.append("")
-    output_parts.append(f"View file: {updated_file.get('webViewLink', '#')}")
-
     return "\n".join(output_parts)
 
 
@@ -1012,19 +889,10 @@ async def update_drive_file(
 @require_google_service("drive", "drive_read")
 async def get_drive_shareable_link(
     service,
-    user_google_email: str,
-    file_id: str,
+    user_google_email: str = "",
+    file_id: str = "",
 ) -> str:
-    """
-    Gets the shareable link for a Google Drive file or folder.
-
-    Args:
-        user_google_email (str): The user's Google email address. Required.
-        file_id (str): The ID of the file or folder to get the shareable link for. Required.
-
-    Returns:
-        str: The shareable links and current sharing status.
-    """
+    """Get shareable link and current permissions for a Drive file or folder."""
     logger.info(
         f"[get_drive_shareable_link] Invoked. Email: '{user_google_email}', File ID: '{file_id}'"
     )
@@ -1086,23 +954,12 @@ async def get_drive_shareable_link(
 @require_google_service("drive", "drive_file")
 async def copy_drive_file(
     service,
-    user_google_email: str,
-    file_id: str,
+    user_google_email: str = "",
+    file_id: str = "",
     new_name: Optional[str] = None,
     parent_folder_id: Optional[str] = None,
 ) -> str:
-    """
-    Creates a copy of a Google Drive file.
-
-    Args:
-        user_google_email (str): The user's Google email address. Required.
-        file_id (str): The ID of the file to copy. Required.
-        new_name (Optional[str]): Name for the copy. Defaults to "Copy of {original name}".
-        parent_folder_id (Optional[str]): Folder ID to place the copy in. If not specified, the copy is placed in the same folder as the original.
-
-    Returns:
-        str: Confirmation with the new file's ID and link.
-    """
+    """Copy a Drive file. Optionally set new_name and parent_folder_id."""
     logger.info(
         f"[copy_drive_file] Invoked. Email: '{user_google_email}', File ID: '{file_id}'"
     )
@@ -1148,21 +1005,11 @@ async def copy_drive_file(
 @require_google_service("drive", "drive_file")
 async def trash_drive_file(
     service,
-    user_google_email: str,
-    file_id: str,
+    user_google_email: str = "",
+    file_id: str = "",
     untrash: bool = False,
 ) -> str:
-    """
-    Moves a Google Drive file to the trash, or restores it from the trash.
-
-    Args:
-        user_google_email (str): The user's Google email address. Required.
-        file_id (str): The ID of the file to trash or restore. Required.
-        untrash (bool): If True, restores the file from trash instead of trashing it. Defaults to False.
-
-    Returns:
-        str: Confirmation message with the file name and action taken.
-    """
+    """Move a file to trash, or restore it (untrash=True)."""
     action = "untrash" if untrash else "trash"
     logger.info(
         f"[trash_drive_file] Invoked. Email: '{user_google_email}', File ID: '{file_id}', Action: {action}"
@@ -1187,18 +1034,10 @@ async def trash_drive_file(
 
     if untrash:
         logger.info(f"[trash_drive_file] Restored '{file_name}' from trash.")
-        return (
-            f"Successfully restored '{file_name}' from trash.\n"
-            f"File ID: {file_id}\n"
-            f"Link: {updated_file.get('webViewLink', '#')}"
-        )
+        return f"Restored '{file_name}' from trash."
     else:
         logger.info(f"[trash_drive_file] Moved '{file_name}' to trash.")
-        return (
-            f"Successfully moved '{file_name}' to trash.\n"
-            f"File ID: {file_id}\n"
-            f"To restore, call trash_drive_file with untrash=True."
-        )
+        return f"Moved '{file_name}' to trash. Restore with untrash=True."
 
 
 @server.tool()
@@ -1206,21 +1045,10 @@ async def trash_drive_file(
 @require_google_service("drive", "drive_file")
 async def delete_drive_file(
     service,
-    user_google_email: str,
-    file_id: str,
+    user_google_email: str = "",
+    file_id: str = "",
 ) -> str:
-    """
-    PERMANENTLY deletes a Google Drive file. This action is irreversible - the file
-    cannot be recovered from trash. Use trash_drive_file instead if you want to
-    move the file to trash with the ability to restore it later.
-
-    Args:
-        user_google_email (str): The user's Google email address. Required.
-        file_id (str): The ID of the file to permanently delete. Required.
-
-    Returns:
-        str: Confirmation that the file was permanently deleted.
-    """
+    """PERMANENTLY delete a Drive file (irreversible). Use trash_drive_file for recoverable deletion."""
     logger.info(
         f"[delete_drive_file] Invoked. Email: '{user_google_email}', File ID: '{file_id}'"
     )
@@ -1238,10 +1066,7 @@ async def delete_drive_file(
     )
 
     logger.info(f"[delete_drive_file] Permanently deleted '{file_name}' ({file_id}).")
-    return (
-        f"Permanently deleted '{file_name}' (ID: {file_id}).\n"
-        f"This action is irreversible."
-    )
+    return f"Permanently deleted '{file_name}'."
 
 
 @server.tool()
@@ -1249,21 +1074,11 @@ async def delete_drive_file(
 @require_google_service("drive", "drive_read")
 async def list_revisions(
     service,
-    user_google_email: str,
-    file_id: str,
+    user_google_email: str = "",
+    file_id: str = "",
     max_results: int = 20,
 ) -> str:
-    """
-    Lists the revision history of a Google Drive file.
-
-    Args:
-        user_google_email (str): The user's Google email address. Required.
-        file_id (str): The ID of the file to list revisions for. Required.
-        max_results (int): Maximum number of revisions to return. Defaults to 20.
-
-    Returns:
-        str: A formatted list of revisions with author, timestamp, size, and revision ID.
-    """
+    """List revision history of a Drive file."""
     logger.info(
         f"[list_revisions] Invoked. Email: '{user_google_email}', File ID: '{file_id}'"
     )
@@ -1286,10 +1101,10 @@ async def list_revisions(
 
     revisions = results.get("revisions", [])
     if not revisions:
-        return f"No revisions found for '{file_name}' (ID: {file_id})."
+        return f"No revisions found for '{file_name}'."
 
     output_parts = [
-        f"Found {len(revisions)} revision(s) for '{file_name}' (ID: {file_id}):"
+        f"Found {len(revisions)} revision(s) for '{file_name}':"
     ]
     for rev in revisions:
         rev_id = rev.get("id", "N/A")
@@ -1311,21 +1126,11 @@ async def list_revisions(
 @require_google_service("drive", "drive_read")
 async def get_revision(
     service,
-    user_google_email: str,
-    file_id: str,
-    revision_id: str,
+    user_google_email: str = "",
+    file_id: str = "",
+    revision_id: str = "",
 ) -> str:
-    """
-    Gets detailed information about a specific revision of a Google Drive file.
-
-    Args:
-        user_google_email (str): The user's Google email address. Required.
-        file_id (str): The ID of the file. Required.
-        revision_id (str): The ID of the specific revision to retrieve. Required.
-
-    Returns:
-        str: Full details of the specified revision.
-    """
+    """Get detailed info about a specific revision of a Drive file."""
     logger.info(
         f"[get_revision] Invoked. Email: '{user_google_email}', File ID: '{file_id}', Revision ID: '{revision_id}'"
     )
@@ -1343,7 +1148,7 @@ async def get_revision(
     )
 
     output_parts = [
-        f"Revision details for '{file_name}' (File ID: {file_id}):",
+        f"Revision details for '{file_name}':",
         f"  Revision ID: {revision.get('id', 'N/A')}",
         f"  Modified Time: {revision.get('modifiedTime', 'N/A')}",
         f"  MIME Type: {revision.get('mimeType', 'N/A')}",
@@ -1379,33 +1184,13 @@ async def get_revision(
 @require_google_service("drive", "drive_file")
 async def export_drive_file(
     service,
-    user_google_email: str,
-    file_id: str,
-    mime_type: str,
+    user_google_email: str = "",
+    file_id: str = "",
+    mime_type: str = "",
     save_to_drive: bool = False,
     save_name: Optional[str] = None,
 ) -> str:
-    """
-    Exports a Google Workspace file (Docs, Sheets, Slides) to a specified format.
-
-    Common mime_type values:
-      - Google Docs: "application/pdf", "text/plain", "text/html",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" (docx)
-      - Google Sheets: "application/pdf", "text/csv",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" (xlsx)
-      - Google Slides: "application/pdf",
-        "application/vnd.openxmlformats-officedocument.presentationml.presentation" (pptx)
-
-    Args:
-        user_google_email (str): The user's Google email address. Required.
-        file_id (str): The ID of the Google Workspace file to export. Required.
-        mime_type (str): The target MIME type for export. Required.
-        save_to_drive (bool): If True, saves the exported content as a new file in Drive. Defaults to False.
-        save_name (Optional[str]): Name for the saved file when save_to_drive is True. Defaults to the original file name with an appropriate extension.
-
-    Returns:
-        str: Export summary (size, type) or confirmation of saved file with ID and link.
-    """
+    """Export a Google Workspace file to a format (pdf, txt, csv, docx, xlsx, pptx). Set save_to_drive=True to save the result back to Drive."""
     logger.info(
         f"[export_drive_file] Invoked. Email: '{user_google_email}', File ID: '{file_id}', Target MIME: '{mime_type}'"
     )
@@ -1495,21 +1280,11 @@ async def export_drive_file(
 @require_google_service("drive", "drive_file")
 async def create_drive_folder(
     service,
-    user_google_email: str,
-    name: str,
+    user_google_email: str = "",
+    name: str = "",
     parent_folder_id: Optional[str] = None,
 ) -> str:
-    """
-    Creates a new folder in Google Drive.
-
-    Args:
-        user_google_email (str): The user's Google email address. Required.
-        name (str): The name for the new folder. Required.
-        parent_folder_id (Optional[str]): The ID of the parent folder. If not specified, the folder is created in the root of My Drive.
-
-    Returns:
-        str: Confirmation with the new folder's ID and link.
-    """
+    """Create a new folder in Drive. Set parent_folder_id to nest it; defaults to root."""
     logger.info(
         f"[create_drive_folder] Invoked. Email: '{user_google_email}', Name: '{name}'"
     )
@@ -1548,21 +1323,11 @@ async def create_drive_folder(
 @require_google_service("drive", "drive_file")
 async def move_drive_file(
     service,
-    user_google_email: str,
-    file_id: str,
-    destination_folder_id: str,
+    user_google_email: str = "",
+    file_id: str = "",
+    destination_folder_id: str = "",
 ) -> str:
-    """
-    Moves a Google Drive file to a different folder.
-
-    Args:
-        user_google_email (str): The user's Google email address. Required.
-        file_id (str): The ID of the file to move. Required.
-        destination_folder_id (str): The ID of the target folder. Required.
-
-    Returns:
-        str: Confirmation message with the file name and new location.
-    """
+    """Move a Drive file to a different folder."""
     logger.info(
         f"[move_drive_file] Invoked. Email: '{user_google_email}', File ID: '{file_id}', Destination: '{destination_folder_id}'"
     )
@@ -1590,12 +1355,7 @@ async def move_drive_file(
         .execute
     )
 
-    link = updated_file.get("webViewLink", "#")
     logger.info(
         f"[move_drive_file] Moved '{file_name}' to folder '{resolved_destination}'."
     )
-    return (
-        f"Successfully moved '{file_name}' to folder '{destination_folder_id}'.\n"
-        f"File ID: {file_id}\n"
-        f"Link: {link}"
-    )
+    return f"Moved '{file_name}' to folder '{destination_folder_id}'."

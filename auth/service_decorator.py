@@ -47,6 +47,12 @@ from auth.scopes import (
 logger = logging.getLogger(__name__)
 
 
+def _should_auto_resolve_email() -> bool:
+    """Check if user_google_email should be auto-resolved (hidden from tool schema)."""
+    import os
+    return is_oauth21_enabled() or os.getenv("MCP_SINGLE_USER_MODE") == "1"
+
+
 # Authentication helper functions
 def _get_auth_context(
     tool_name: str,
@@ -525,8 +531,8 @@ def require_google_service(
             )
 
         # Create a new signature for the wrapper that excludes the 'service' parameter.
-        # In OAuth 2.1 mode, also exclude 'user_google_email' since it's automatically determined.
-        if is_oauth21_enabled():
+        # In OAuth 2.1 or single-user mode, also exclude 'user_google_email' since it's automatically determined.
+        if _should_auto_resolve_email():
             # Remove both 'service' and 'user_google_email' parameters
             filtered_params = [p for p in params[1:] if p.name != "user_google_email"]
             wrapper_sig = original_sig.replace(parameters=filtered_params)
@@ -545,10 +551,25 @@ def require_google_service(
             )
 
             # Extract user_google_email based on OAuth mode
-            if is_oauth21_enabled():
-                user_google_email = _extract_oauth21_user_email(
-                    authenticated_user, func.__name__
-                )
+            if _should_auto_resolve_email():
+                if authenticated_user:
+                    user_google_email = authenticated_user
+                else:
+                    # Fallback: try credential store for single-user mode
+                    user_google_email = None
+                    try:
+                        from auth.credential_store import get_credential_store
+                        store = get_credential_store()
+                        users = store.list_users()
+                        if users:
+                            user_google_email = users[0]
+                    except Exception:
+                        pass
+                    if not user_google_email:
+                        raise Exception(
+                            f"Auto-resolve mode requires an authenticated user for {func.__name__}, "
+                            f"but none was found in context or credential store."
+                        )
             else:
                 user_google_email = _extract_oauth20_user_email(
                     args, kwargs, wrapper_sig
@@ -578,9 +599,9 @@ def require_google_service(
                     authenticated_user, mcp_session_id, tool_name
                 )
 
-                # In OAuth 2.1 mode, user_google_email is already set to authenticated_user
+                # In auto-resolve mode, user_google_email is already set to authenticated_user
                 # In OAuth 2.0 mode, we may need to override it
-                if not is_oauth21_enabled():
+                if not _should_auto_resolve_email():
                     wrapper_params = list(wrapper_sig.parameters.keys())
                     user_google_email, args = _override_oauth21_user_email(
                         use_oauth21,
@@ -613,8 +634,8 @@ def require_google_service(
                 raise
 
             try:
-                # In OAuth 2.1 mode, we need to add user_google_email to kwargs since it was removed from signature
-                if is_oauth21_enabled():
+                # In auto-resolve mode, we need to add user_google_email to kwargs since it was removed from signature
+                if _should_auto_resolve_email():
                     kwargs["user_google_email"] = user_google_email
 
                 # Prepend the fetched service object to the original arguments
@@ -629,9 +650,9 @@ def require_google_service(
         wrapper.__signature__ = wrapper_sig
 
         # Conditionally modify docstring to remove user_google_email parameter documentation
-        if is_oauth21_enabled():
+        if _should_auto_resolve_email():
             logger.debug(
-                "OAuth 2.1 mode enabled, removing user_google_email from docstring"
+                "Auto-resolve mode enabled, removing user_google_email from docstring"
             )
             if func.__doc__:
                 wrapper.__doc__ = _remove_user_email_arg_from_docstring(func.__doc__)
@@ -667,9 +688,9 @@ def require_multiple_services(service_configs: List[Dict[str, Any]]):
         service_param_names = {config["param_name"] for config in service_configs}
         params = list(original_sig.parameters.values())
 
-        # Remove injected service params from the wrapper signature; drop user_google_email only for OAuth 2.1.
+        # Remove injected service params from the wrapper signature; drop user_google_email in auto-resolve mode.
         filtered_params = [p for p in params if p.name not in service_param_names]
-        if is_oauth21_enabled():
+        if _should_auto_resolve_email():
             filtered_params = [
                 p for p in filtered_params if p.name != "user_google_email"
             ]
@@ -684,10 +705,25 @@ def require_multiple_services(service_configs: List[Dict[str, Any]]):
             authenticated_user, _, mcp_session_id = _get_auth_context(tool_name)
 
             # Extract user_google_email based on OAuth mode
-            if is_oauth21_enabled():
-                user_google_email = _extract_oauth21_user_email(
-                    authenticated_user, tool_name
-                )
+            if _should_auto_resolve_email():
+                if authenticated_user:
+                    user_google_email = authenticated_user
+                else:
+                    # Fallback: try credential store for single-user mode
+                    user_google_email = None
+                    try:
+                        from auth.credential_store import get_credential_store
+                        store = get_credential_store()
+                        users = store.list_users()
+                        if users:
+                            user_google_email = users[0]
+                    except Exception:
+                        pass
+                    if not user_google_email:
+                        raise Exception(
+                            f"Auto-resolve mode requires an authenticated user for {tool_name}, "
+                            f"but none was found in context or credential store."
+                        )
             else:
                 user_google_email = _extract_oauth20_user_email(
                     args, kwargs, wrapper_sig
@@ -715,7 +751,7 @@ def require_multiple_services(service_configs: List[Dict[str, Any]]):
                     )
 
                     # In OAuth 2.0 mode, we may need to override user_google_email
-                    if not is_oauth21_enabled():
+                    if not _should_auto_resolve_email():
                         user_google_email, args = _override_oauth21_user_email(
                             use_oauth21,
                             authenticated_user,
@@ -751,8 +787,8 @@ def require_multiple_services(service_configs: List[Dict[str, Any]]):
 
             # Call the original function with refresh error handling
             try:
-                # In OAuth 2.1 mode, we need to add user_google_email to kwargs since it was removed from signature
-                if is_oauth21_enabled():
+                # In auto-resolve mode, we need to add user_google_email to kwargs since it was removed from signature
+                if _should_auto_resolve_email():
                     kwargs["user_google_email"] = user_google_email
 
                 return await func(*args, **kwargs)
@@ -767,9 +803,9 @@ def require_multiple_services(service_configs: List[Dict[str, Any]]):
         wrapper.__signature__ = wrapper_sig
 
         # Conditionally modify docstring to remove user_google_email parameter documentation
-        if is_oauth21_enabled():
+        if _should_auto_resolve_email():
             logger.debug(
-                "OAuth 2.1 mode enabled, removing user_google_email from docstring"
+                "Auto-resolve mode enabled, removing user_google_email from docstring"
             )
             if func.__doc__:
                 wrapper.__doc__ = _remove_user_email_arg_from_docstring(func.__doc__)

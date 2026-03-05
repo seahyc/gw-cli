@@ -1,8 +1,8 @@
 """
 Core Comments Module
 
-This module provides reusable comment management functions for Google Workspace applications.
-All Google Workspace apps (Docs, Sheets, Slides) use the Drive API for comment operations.
+Reusable comment management functions for Google Workspace apps.
+All apps (Docs, Sheets, Slides) use the Drive API for comment operations.
 """
 
 import logging
@@ -17,16 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 def create_comment_tools(app_name: str, file_id_param: str):
-    """
-    Factory function to create comment management tools for a specific Google Workspace app.
-
-    Args:
-        app_name: Name of the app (e.g., "document", "spreadsheet", "presentation")
-        file_id_param: Parameter name for the file ID (e.g., "document_id", "spreadsheet_id", "presentation_id")
-
-    Returns:
-        Dict containing the four comment management functions with unique names
-    """
+    """Factory to create comment tools for a Google Workspace app."""
 
     # Create unique function names based on the app type
     read_func_name = f"read_{app_name}_comments"
@@ -38,306 +29,75 @@ def create_comment_tools(app_name: str, file_id_param: str):
     edit_reply_func_name = f"edit_{app_name}_comment_reply"
     delete_reply_func_name = f"delete_{app_name}_comment_reply"
 
-    # Create functions without decorators first, then apply decorators with proper names
-    if file_id_param == "document_id":
+    @require_google_service("drive", "drive_read")
+    @handle_http_errors(read_func_name, service_type="drive")
+    async def read_comments(
+        service, user_google_email: str = "", file_id: str = ""
+    ) -> str:
+        """Read all comments from a Google Workspace file."""
+        return await _read_comments_impl(service, app_name, file_id)
 
-        @require_google_service("drive", "drive_read")
-        @handle_http_errors(read_func_name, service_type="drive")
-        async def read_comments(
-            service, user_google_email: str, document_id: str
-        ) -> str:
-            """Read all comments from a Google Document."""
-            return await _read_comments_impl(service, app_name, document_id)
+    @require_google_service("drive", "drive_file")
+    @handle_http_errors(create_func_name, service_type="drive")
+    async def create_comment(
+        service, user_google_email: str = "", file_id: str = "", comment_content: str = ""
+    ) -> str:
+        """Create a new comment on a Google Workspace file."""
+        return await _create_comment_impl(service, app_name, file_id, comment_content)
 
-        @require_google_service("drive", "drive_file")
-        @handle_http_errors(create_func_name, service_type="drive")
-        async def create_comment(
-            service, user_google_email: str, document_id: str, comment_content: str
-        ) -> str:
-            """Create a new comment on a Google Document."""
-            return await _create_comment_impl(
-                service, app_name, document_id, comment_content
-            )
+    @require_google_service("drive", "drive_file")
+    @handle_http_errors(reply_func_name, service_type="drive")
+    async def reply_to_comment(
+        service,
+        user_google_email: str = "",
+        file_id: str = "",
+        comment_id: str = "",
+        reply_content: str = "",
+    ) -> str:
+        """Reply to a comment on a Google Workspace file."""
+        return await _reply_to_comment_impl(
+            service, app_name, file_id, comment_id, reply_content
+        )
 
-        @require_google_service("drive", "drive_file")
-        @handle_http_errors(reply_func_name, service_type="drive")
-        async def reply_to_comment(
-            service,
-            user_google_email: str,
-            document_id: str,
-            comment_id: str,
-            reply_content: str,
-        ) -> str:
-            """Reply to a specific comment in a Google Document."""
-            return await _reply_to_comment_impl(
-                service, app_name, document_id, comment_id, reply_content
-            )
+    @require_google_service("drive", "drive_file")
+    @handle_http_errors(resolve_func_name, service_type="drive")
+    async def resolve_comment(
+        service, user_google_email: str = "", file_id: str = "", comment_id: str = ""
+    ) -> str:
+        """Resolve a comment on a Google Workspace file."""
+        return await _resolve_comment_impl(service, app_name, file_id, comment_id)
 
-        @require_google_service("drive", "drive_file")
-        @handle_http_errors(resolve_func_name, service_type="drive")
-        async def resolve_comment(
-            service, user_google_email: str, document_id: str, comment_id: str
-        ) -> str:
-            """Resolve a comment in a Google Document."""
-            return await _resolve_comment_impl(
-                service, app_name, document_id, comment_id
-            )
+    @require_google_service("drive", "drive_file")
+    @handle_http_errors(edit_comment_func_name, service_type="drive")
+    async def edit_comment(
+        service, user_google_email: str = "", file_id: str = "", comment_id: str = "", new_content: str = ""
+    ) -> str:
+        """Edit an existing comment on a Google Workspace file."""
+        return await _edit_comment_impl(service, app_name, file_id, comment_id, new_content)
 
-        @require_google_service("drive", "drive_file")
-        @handle_http_errors(edit_comment_func_name, service_type="drive")
-        async def edit_comment(
-            service, user_google_email: str, document_id: str, comment_id: str, new_content: str
-        ) -> str:
-            """Edit an existing comment on a Google Document.
+    @require_google_service("drive", "drive_file")
+    @handle_http_errors(delete_comment_func_name, service_type="drive")
+    async def delete_comment(
+        service, user_google_email: str = "", file_id: str = "", comment_id: str = ""
+    ) -> str:
+        """Delete a comment from a Google Workspace file."""
+        return await _delete_comment_impl(service, app_name, file_id, comment_id)
 
-            Args:
-                document_id: The ID of the Google Document
-                comment_id: The ID of the comment to edit
-                new_content: The new content for the comment
-            """
-            return await _edit_comment_impl(service, app_name, document_id, comment_id, new_content)
+    @require_google_service("drive", "drive_file")
+    @handle_http_errors(edit_reply_func_name, service_type="drive")
+    async def edit_reply(
+        service, user_google_email: str = "", file_id: str = "", comment_id: str = "", reply_id: str = "", new_content: str = ""
+    ) -> str:
+        """Edit a reply on a comment in a Google Workspace file."""
+        return await _edit_reply_impl(service, app_name, file_id, comment_id, reply_id, new_content)
 
-        @require_google_service("drive", "drive_file")
-        @handle_http_errors(delete_comment_func_name, service_type="drive")
-        async def delete_comment(
-            service, user_google_email: str, document_id: str, comment_id: str
-        ) -> str:
-            """Delete a comment from a Google Document.
-
-            Args:
-                document_id: The ID of the Google Document
-                comment_id: The ID of the comment to delete
-            """
-            return await _delete_comment_impl(service, app_name, document_id, comment_id)
-
-        @require_google_service("drive", "drive_file")
-        @handle_http_errors(edit_reply_func_name, service_type="drive")
-        async def edit_reply(
-            service, user_google_email: str, document_id: str, comment_id: str, reply_id: str, new_content: str
-        ) -> str:
-            """Edit an existing reply on a comment in a Google Document.
-
-            Args:
-                document_id: The ID of the Google Document
-                comment_id: The ID of the parent comment
-                reply_id: The ID of the reply to edit
-                new_content: The new content for the reply
-            """
-            return await _edit_reply_impl(service, app_name, document_id, comment_id, reply_id, new_content)
-
-        @require_google_service("drive", "drive_file")
-        @handle_http_errors(delete_reply_func_name, service_type="drive")
-        async def delete_reply(
-            service, user_google_email: str, document_id: str, comment_id: str, reply_id: str
-        ) -> str:
-            """Delete a reply from a comment in a Google Document.
-
-            Args:
-                document_id: The ID of the Google Document
-                comment_id: The ID of the parent comment
-                reply_id: The ID of the reply to delete
-            """
-            return await _delete_reply_impl(service, app_name, document_id, comment_id, reply_id)
-
-    elif file_id_param == "spreadsheet_id":
-
-        @require_google_service("drive", "drive_read")
-        @handle_http_errors(read_func_name, service_type="drive")
-        async def read_comments(
-            service, user_google_email: str, spreadsheet_id: str
-        ) -> str:
-            """Read all comments from a Google Spreadsheet."""
-            return await _read_comments_impl(service, app_name, spreadsheet_id)
-
-        @require_google_service("drive", "drive_file")
-        @handle_http_errors(create_func_name, service_type="drive")
-        async def create_comment(
-            service, user_google_email: str, spreadsheet_id: str, comment_content: str
-        ) -> str:
-            """Create a new comment on a Google Spreadsheet."""
-            return await _create_comment_impl(
-                service, app_name, spreadsheet_id, comment_content
-            )
-
-        @require_google_service("drive", "drive_file")
-        @handle_http_errors(reply_func_name, service_type="drive")
-        async def reply_to_comment(
-            service,
-            user_google_email: str,
-            spreadsheet_id: str,
-            comment_id: str,
-            reply_content: str,
-        ) -> str:
-            """Reply to a specific comment in a Google Spreadsheet."""
-            return await _reply_to_comment_impl(
-                service, app_name, spreadsheet_id, comment_id, reply_content
-            )
-
-        @require_google_service("drive", "drive_file")
-        @handle_http_errors(resolve_func_name, service_type="drive")
-        async def resolve_comment(
-            service, user_google_email: str, spreadsheet_id: str, comment_id: str
-        ) -> str:
-            """Resolve a comment in a Google Spreadsheet."""
-            return await _resolve_comment_impl(
-                service, app_name, spreadsheet_id, comment_id
-            )
-
-        @require_google_service("drive", "drive_file")
-        @handle_http_errors(edit_comment_func_name, service_type="drive")
-        async def edit_comment(
-            service, user_google_email: str, spreadsheet_id: str, comment_id: str, new_content: str
-        ) -> str:
-            """Edit an existing comment on a Google Spreadsheet.
-
-            Args:
-                spreadsheet_id: The ID of the Google Spreadsheet
-                comment_id: The ID of the comment to edit
-                new_content: The new content for the comment
-            """
-            return await _edit_comment_impl(service, app_name, spreadsheet_id, comment_id, new_content)
-
-        @require_google_service("drive", "drive_file")
-        @handle_http_errors(delete_comment_func_name, service_type="drive")
-        async def delete_comment(
-            service, user_google_email: str, spreadsheet_id: str, comment_id: str
-        ) -> str:
-            """Delete a comment from a Google Spreadsheet.
-
-            Args:
-                spreadsheet_id: The ID of the Google Spreadsheet
-                comment_id: The ID of the comment to delete
-            """
-            return await _delete_comment_impl(service, app_name, spreadsheet_id, comment_id)
-
-        @require_google_service("drive", "drive_file")
-        @handle_http_errors(edit_reply_func_name, service_type="drive")
-        async def edit_reply(
-            service, user_google_email: str, spreadsheet_id: str, comment_id: str, reply_id: str, new_content: str
-        ) -> str:
-            """Edit an existing reply on a comment in a Google Spreadsheet.
-
-            Args:
-                spreadsheet_id: The ID of the Google Spreadsheet
-                comment_id: The ID of the parent comment
-                reply_id: The ID of the reply to edit
-                new_content: The new content for the reply
-            """
-            return await _edit_reply_impl(service, app_name, spreadsheet_id, comment_id, reply_id, new_content)
-
-        @require_google_service("drive", "drive_file")
-        @handle_http_errors(delete_reply_func_name, service_type="drive")
-        async def delete_reply(
-            service, user_google_email: str, spreadsheet_id: str, comment_id: str, reply_id: str
-        ) -> str:
-            """Delete a reply from a comment in a Google Spreadsheet.
-
-            Args:
-                spreadsheet_id: The ID of the Google Spreadsheet
-                comment_id: The ID of the parent comment
-                reply_id: The ID of the reply to delete
-            """
-            return await _delete_reply_impl(service, app_name, spreadsheet_id, comment_id, reply_id)
-
-    elif file_id_param == "presentation_id":
-
-        @require_google_service("drive", "drive_read")
-        @handle_http_errors(read_func_name, service_type="drive")
-        async def read_comments(
-            service, user_google_email: str, presentation_id: str
-        ) -> str:
-            """Read all comments from a Google Presentation."""
-            return await _read_comments_impl(service, app_name, presentation_id)
-
-        @require_google_service("drive", "drive_file")
-        @handle_http_errors(create_func_name, service_type="drive")
-        async def create_comment(
-            service, user_google_email: str, presentation_id: str, comment_content: str
-        ) -> str:
-            """Create a new comment on a Google Presentation."""
-            return await _create_comment_impl(
-                service, app_name, presentation_id, comment_content
-            )
-
-        @require_google_service("drive", "drive_file")
-        @handle_http_errors(reply_func_name, service_type="drive")
-        async def reply_to_comment(
-            service,
-            user_google_email: str,
-            presentation_id: str,
-            comment_id: str,
-            reply_content: str,
-        ) -> str:
-            """Reply to a specific comment in a Google Presentation."""
-            return await _reply_to_comment_impl(
-                service, app_name, presentation_id, comment_id, reply_content
-            )
-
-        @require_google_service("drive", "drive_file")
-        @handle_http_errors(resolve_func_name, service_type="drive")
-        async def resolve_comment(
-            service, user_google_email: str, presentation_id: str, comment_id: str
-        ) -> str:
-            """Resolve a comment in a Google Presentation."""
-            return await _resolve_comment_impl(
-                service, app_name, presentation_id, comment_id
-            )
-
-        @require_google_service("drive", "drive_file")
-        @handle_http_errors(edit_comment_func_name, service_type="drive")
-        async def edit_comment(
-            service, user_google_email: str, presentation_id: str, comment_id: str, new_content: str
-        ) -> str:
-            """Edit an existing comment on a Google Presentation.
-
-            Args:
-                presentation_id: The ID of the Google Presentation
-                comment_id: The ID of the comment to edit
-                new_content: The new content for the comment
-            """
-            return await _edit_comment_impl(service, app_name, presentation_id, comment_id, new_content)
-
-        @require_google_service("drive", "drive_file")
-        @handle_http_errors(delete_comment_func_name, service_type="drive")
-        async def delete_comment(
-            service, user_google_email: str, presentation_id: str, comment_id: str
-        ) -> str:
-            """Delete a comment from a Google Presentation.
-
-            Args:
-                presentation_id: The ID of the Google Presentation
-                comment_id: The ID of the comment to delete
-            """
-            return await _delete_comment_impl(service, app_name, presentation_id, comment_id)
-
-        @require_google_service("drive", "drive_file")
-        @handle_http_errors(edit_reply_func_name, service_type="drive")
-        async def edit_reply(
-            service, user_google_email: str, presentation_id: str, comment_id: str, reply_id: str, new_content: str
-        ) -> str:
-            """Edit an existing reply on a comment in a Google Presentation.
-
-            Args:
-                presentation_id: The ID of the Google Presentation
-                comment_id: The ID of the parent comment
-                reply_id: The ID of the reply to edit
-                new_content: The new content for the reply
-            """
-            return await _edit_reply_impl(service, app_name, presentation_id, comment_id, reply_id, new_content)
-
-        @require_google_service("drive", "drive_file")
-        @handle_http_errors(delete_reply_func_name, service_type="drive")
-        async def delete_reply(
-            service, user_google_email: str, presentation_id: str, comment_id: str, reply_id: str
-        ) -> str:
-            """Delete a reply from a comment in a Google Presentation.
-
-            Args:
-                presentation_id: The ID of the Google Presentation
-                comment_id: The ID of the parent comment
-                reply_id: The ID of the reply to delete
-            """
-            return await _delete_reply_impl(service, app_name, presentation_id, comment_id, reply_id)
+    @require_google_service("drive", "drive_file")
+    @handle_http_errors(delete_reply_func_name, service_type="drive")
+    async def delete_reply(
+        service, user_google_email: str = "", file_id: str = "", comment_id: str = "", reply_id: str = ""
+    ) -> str:
+        """Delete a reply from a comment in a Google Workspace file."""
+        return await _delete_reply_impl(service, app_name, file_id, comment_id, reply_id)
 
     # Set the proper function names and register with server
     read_comments.__name__ = read_func_name
@@ -373,7 +133,7 @@ def create_comment_tools(app_name: str, file_id_param: str):
 
 async def _read_comments_impl(service, app_name: str, file_id: str) -> str:
     """Implementation for reading comments from any Google Workspace file."""
-    logger.info(f"[read_{app_name}_comments] Reading comments for {app_name} {file_id}")
+    logger.info(f"[read_{app_name}_comments] Reading comments for {file_id}")
 
     response = await asyncio.to_thread(
         service.comments()
@@ -387,9 +147,9 @@ async def _read_comments_impl(service, app_name: str, file_id: str) -> str:
     comments = response.get("comments", [])
 
     if not comments:
-        return f"No comments found in {app_name} {file_id}"
+        return "No comments found."
 
-    output = [f"Found {len(comments)} comments in {app_name} {file_id}:\\n"]
+    output = [f"Found {len(comments)} comments:\\n"]
 
     for comment in comments:
         author = comment.get("author", {}).get("displayName", "Unknown")
@@ -427,7 +187,7 @@ async def _create_comment_impl(
     service, app_name: str, file_id: str, comment_content: str
 ) -> str:
     """Implementation for creating a comment on any Google Workspace file."""
-    logger.info(f"[create_{app_name}_comment] Creating comment in {app_name} {file_id}")
+    logger.info(f"[create_{app_name}_comment] Creating comment in {file_id}")
 
     body = {"content": comment_content}
 
@@ -445,7 +205,7 @@ async def _create_comment_impl(
     author = comment.get("author", {}).get("displayName", "Unknown")
     created = comment.get("createdTime", "")
 
-    return f"Comment created successfully!\\nComment ID: {comment_id}\\nAuthor: {author}\\nCreated: {created}\\nContent: {comment_content}"
+    return f"Comment created.\\nComment ID: {comment_id}\\nAuthor: {author}\\nCreated: {created}"
 
 
 async def _reply_to_comment_impl(
@@ -453,7 +213,7 @@ async def _reply_to_comment_impl(
 ) -> str:
     """Implementation for replying to a comment on any Google Workspace file."""
     logger.info(
-        f"[reply_to_{app_name}_comment] Replying to comment {comment_id} in {app_name} {file_id}"
+        f"[reply_to_{app_name}_comment] Replying to comment {comment_id} in {file_id}"
     )
 
     body = {"content": reply_content}
@@ -473,7 +233,7 @@ async def _reply_to_comment_impl(
     author = reply.get("author", {}).get("displayName", "Unknown")
     created = reply.get("createdTime", "")
 
-    return f"Reply posted successfully!\\nReply ID: {reply_id}\\nAuthor: {author}\\nCreated: {created}\\nContent: {reply_content}"
+    return f"Reply posted.\\nReply ID: {reply_id}\\nAuthor: {author}\\nCreated: {created}"
 
 
 async def _resolve_comment_impl(
@@ -481,7 +241,7 @@ async def _resolve_comment_impl(
 ) -> str:
     """Implementation for resolving a comment on any Google Workspace file."""
     logger.info(
-        f"[resolve_{app_name}_comment] Resolving comment {comment_id} in {app_name} {file_id}"
+        f"[resolve_{app_name}_comment] Resolving comment {comment_id} in {file_id}"
     )
 
     body = {"content": "This comment has been resolved.", "action": "resolve"}
@@ -501,7 +261,7 @@ async def _resolve_comment_impl(
     author = reply.get("author", {}).get("displayName", "Unknown")
     created = reply.get("createdTime", "")
 
-    return f"Comment {comment_id} has been resolved successfully.\\nResolve reply ID: {reply_id}\\nAuthor: {author}\\nCreated: {created}"
+    return f"Comment resolved.\\nResolve reply ID: {reply_id}\\nAuthor: {author}\\nCreated: {created}"
 
 
 async def _edit_comment_impl(
@@ -509,7 +269,7 @@ async def _edit_comment_impl(
 ) -> str:
     """Implementation for editing a comment on any Google Workspace file."""
     logger.info(
-        f"[edit_{app_name}_comment] Editing comment {comment_id} in {app_name} {file_id}"
+        f"[edit_{app_name}_comment] Editing comment {comment_id} in {file_id}"
     )
 
     body = {"content": new_content}
@@ -528,7 +288,7 @@ async def _edit_comment_impl(
     author = comment.get("author", {}).get("displayName", "Unknown")
     modified = comment.get("modifiedTime", "")
 
-    return f"Comment {comment_id} updated successfully!\nAuthor: {author}\nModified: {modified}\nNew content: {new_content}"
+    return f"Comment updated.\\nAuthor: {author}\\nModified: {modified}"
 
 
 async def _delete_comment_impl(
@@ -536,7 +296,7 @@ async def _delete_comment_impl(
 ) -> str:
     """Implementation for deleting a comment on any Google Workspace file."""
     logger.info(
-        f"[delete_{app_name}_comment] Deleting comment {comment_id} in {app_name} {file_id}"
+        f"[delete_{app_name}_comment] Deleting comment {comment_id} in {file_id}"
     )
 
     await asyncio.to_thread(
@@ -548,7 +308,7 @@ async def _delete_comment_impl(
         .execute
     )
 
-    return f"Comment {comment_id} deleted successfully from {app_name} {file_id}."
+    return f"Comment {comment_id} deleted."
 
 
 async def _edit_reply_impl(
@@ -556,7 +316,7 @@ async def _edit_reply_impl(
 ) -> str:
     """Implementation for editing a reply on any Google Workspace file."""
     logger.info(
-        f"[edit_{app_name}_comment_reply] Editing reply {reply_id} on comment {comment_id} in {app_name} {file_id}"
+        f"[edit_{app_name}_comment_reply] Editing reply {reply_id} on comment {comment_id} in {file_id}"
     )
 
     body = {"content": new_content}
@@ -576,7 +336,7 @@ async def _edit_reply_impl(
     author = reply.get("author", {}).get("displayName", "Unknown")
     modified = reply.get("modifiedTime", "")
 
-    return f"Reply {reply_id} updated successfully!\nAuthor: {author}\nModified: {modified}\nNew content: {new_content}"
+    return f"Reply updated.\\nAuthor: {author}\\nModified: {modified}"
 
 
 async def _delete_reply_impl(
@@ -584,7 +344,7 @@ async def _delete_reply_impl(
 ) -> str:
     """Implementation for deleting a reply on any Google Workspace file."""
     logger.info(
-        f"[delete_{app_name}_comment_reply] Deleting reply {reply_id} on comment {comment_id} in {app_name} {file_id}"
+        f"[delete_{app_name}_comment_reply] Deleting reply {reply_id} on comment {comment_id} in {file_id}"
     )
 
     await asyncio.to_thread(
@@ -597,4 +357,4 @@ async def _delete_reply_impl(
         .execute
     )
 
-    return f"Reply {reply_id} deleted successfully from comment {comment_id} in {app_name} {file_id}."
+    return f"Reply {reply_id} deleted."

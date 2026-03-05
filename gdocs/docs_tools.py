@@ -54,16 +54,11 @@ logger = logging.getLogger(__name__)
 @require_google_service("drive", "drive_read")
 async def search_docs(
     service: Any,
-    user_google_email: str,
-    query: str,
+    user_google_email: str = "",
+    query: str = "",
     page_size: int = 10,
 ) -> str:
-    """
-    Searches for Google Docs by name using Drive API (mimeType filter).
-
-    Returns:
-        str: A formatted list of Google Docs matching the search query.
-    """
+    """Search for Google Docs by name. Returns matching doc names, IDs, and links."""
     logger.info(f"[search_docs] Email={user_google_email}, Query='{query}'")
 
     escaped_query = query.replace("'", "\\'")
@@ -106,26 +101,19 @@ async def search_docs(
 async def get_doc_content(
     drive_service: Any,
     docs_service: Any,
-    user_google_email: str,
-    document_id: str,
+    user_google_email: str = "",
+    file_id: str = "",
 ) -> str:
-    """
-    Retrieves content of a Google Doc or a Drive file (like .docx) identified by document_id.
-    - Native Google Docs: Fetches content via Docs API.
-    - Office files (.docx, etc.) stored in Drive: Downloads via Drive API and extracts text.
-
-    Returns:
-        str: The document content with metadata header.
-    """
+    """Retrieve content of a Google Doc or Drive file (.docx). Returns text with metadata header."""
     logger.info(
-        f"[get_doc_content] Invoked. Document/File ID: '{document_id}' for user '{user_google_email}'"
+        f"[get_doc_content] Invoked. Document/File ID: '{file_id}' for user '{user_google_email}'"
     )
 
     # Step 2: Get file metadata from Drive
     file_metadata = await asyncio.to_thread(
         drive_service.files()
         .get(
-            fileId=document_id,
+            fileId=file_id,
             fields="id, name, mimeType, webViewLink",
             supportsAllDrives=True,
         )
@@ -136,7 +124,7 @@ async def get_doc_content(
     web_view_link = file_metadata.get("webViewLink", "#")
 
     logger.info(
-        f"[get_doc_content] File '{file_name}' (ID: {document_id}) has mimeType: '{mime_type}'"
+        f"[get_doc_content] File '{file_name}' (ID: {file_id}) has mimeType: '{mime_type}'"
     )
 
     body_text = ""  # Initialize body_text
@@ -146,7 +134,7 @@ async def get_doc_content(
         logger.info("[get_doc_content] Processing as native Google Doc.")
         doc_data = await asyncio.to_thread(
             docs_service.documents()
-            .get(documentId=document_id, includeTabsContent=True)
+            .get(documentId=file_id, includeTabsContent=True)
             .execute
         )
         # Tab header format constant
@@ -238,13 +226,13 @@ async def get_doc_content(
 
         request_obj = (
             drive_service.files().export_media(
-                fileId=document_id,
+                fileId=file_id,
                 mimeType=effective_export_mime,
                 supportsAllDrives=True,
             )
             if effective_export_mime
             else drive_service.files().get_media(
-                fileId=document_id, supportsAllDrives=True
+                fileId=file_id, supportsAllDrives=True
             )
         )
 
@@ -270,7 +258,7 @@ async def get_doc_content(
                 )
 
     header = (
-        f'File: "{file_name}" (ID: {document_id}, Type: {mime_type})\n'
+        f'File: "{file_name}" (ID: {file_id}, Type: {mime_type})\n'
         f"Link: {web_view_link}\n\n--- CONTENT ---\n"
     )
     return header + body_text
@@ -280,14 +268,9 @@ async def get_doc_content(
 @handle_http_errors("list_docs_in_folder", is_read_only=True, service_type="docs")
 @require_google_service("drive", "drive_read")
 async def list_docs_in_folder(
-    service: Any, user_google_email: str, folder_id: str = "root", page_size: int = 100
+    service: Any, user_google_email: str = "", folder_id: str = "root", page_size: int = 100
 ) -> str:
-    """
-    Lists Google Docs within a specific Drive folder.
-
-    Returns:
-        str: A formatted list of Google Docs in the specified folder.
-    """
+    """List Google Docs in a Drive folder. Returns doc names, IDs, and links."""
     logger.info(
         f"[list_docs_in_folder] Invoked. Email: '{user_google_email}', Folder ID: '{folder_id}'"
     )
@@ -319,17 +302,12 @@ async def list_docs_in_folder(
 @require_google_service("docs", "docs_write")
 async def create_doc(
     service: Any,
-    user_google_email: str,
-    title: str,
+    user_google_email: str = "",
+    title: str = "",
     content: str = "",
 ) -> str:
-    """
-    Creates a new Google Doc and optionally inserts initial content.
-
-    Returns:
-        str: Confirmation message with document ID and link.
-    """
-    logger.info(f"[create_doc] Invoked. Email: '{user_google_email}', Title='{title}'")
+    """Create a new Google Doc, optionally with initial content. Returns new doc ID and link."""
+    logger.info(f"[create_doc] Title='{title}'")
 
     doc = await asyncio.to_thread(
         service.documents().create(body={"title": title}).execute
@@ -343,10 +321,8 @@ async def create_doc(
             .execute
         )
     link = f"https://docs.google.com/document/d/{doc_id}/edit"
-    msg = f"Created Google Doc '{title}' (ID: {doc_id}) for {user_google_email}. Link: {link}"
-    logger.info(
-        f"Successfully created Google Doc '{title}' (ID: {doc_id}) for {user_google_email}. Link: {link}"
-    )
+    msg = f"Created Google Doc '{title}' (ID: {doc_id}). Link: {link}"
+    logger.info(f"[create_doc] Created '{title}' (ID: {doc_id})")
     return msg
 
 
@@ -355,9 +331,9 @@ async def create_doc(
 @require_google_service("docs", "docs_write")
 async def modify_doc_text(
     service: Any,
-    user_google_email: str,
-    document_id: str,
-    start_index: int,
+    user_google_email: str = "",
+    file_id: str = "",
+    start_index: int = 0,
     end_index: int = None,
     text: str = None,
     bold: bool = None,
@@ -372,41 +348,18 @@ async def modify_doc_text(
     subscript: bool = None,
     link_url: str = None,
 ) -> str:
-    """
-    Modifies text in a Google Doc - can insert/replace text and/or apply formatting in a single operation.
-
-    Args:
-        user_google_email: User's Google email address
-        document_id: ID of the document to update
-        start_index: Start position for operation (0-based)
-        end_index: End position for text replacement/formatting (if not provided with text, text is inserted)
-        text: New text to insert or replace with (optional - can format existing text without changing it)
-        bold: Whether to make text bold (True/False/None to leave unchanged)
-        italic: Whether to make text italic (True/False/None to leave unchanged)
-        underline: Whether to underline text (True/False/None to leave unchanged)
-        font_size: Font size in points
-        font_family: Font family name (e.g., "Arial", "Times New Roman")
-        text_color: Foreground text color (#RRGGBB)
-        background_color: Background/highlight color (#RRGGBB)
-        strikethrough: Whether to apply strikethrough (True/False/None to leave unchanged)
-        superscript: Whether to make text superscript (True/False/None to leave unchanged)
-        subscript: Whether to make text subscript (True/False/None to leave unchanged)
-        link_url: URL to link the text to (string or None to leave unchanged)
-
-    Returns:
-        str: Confirmation message with operation details
-    """
+    """Insert/replace text and apply character formatting at a position in a Google Doc."""
     all_formatting = [bold, italic, underline, font_size, font_family, text_color,
                        background_color, strikethrough, superscript, subscript, link_url]
     logger.info(
-        f"[modify_doc_text] Doc={document_id}, start={start_index}, end={end_index}, text={text is not None}, "
+        f"[modify_doc_text] Doc={file_id}, start={start_index}, end={end_index}, text={text is not None}, "
         f"formatting={any(p is not None for p in all_formatting)}"
     )
 
     # Input validation
     validator = ValidationManager()
 
-    is_valid, error_msg = validator.validate_document_id(document_id)
+    is_valid, error_msg = validator.validate_document_id(file_id)
     if not is_valid:
         return f"Error: {error_msg}"
 
@@ -557,14 +510,13 @@ async def modify_doc_text(
 
     await asyncio.to_thread(
         service.documents()
-        .batchUpdate(documentId=document_id, body={"requests": requests})
+        .batchUpdate(documentId=file_id, body={"requests": requests})
         .execute
     )
 
-    link = f"https://docs.google.com/document/d/{document_id}/edit"
     operation_summary = "; ".join(operations)
     text_info = f" Text length: {len(text)} characters." if text else ""
-    return f"{operation_summary} in document {document_id}.{text_info} Link: {link}"
+    return f"{operation_summary}.{text_info}"
 
 
 @server.tool()
@@ -572,34 +524,22 @@ async def modify_doc_text(
 @require_google_service("docs", "docs_write")
 async def find_and_replace_doc(
     service: Any,
-    user_google_email: str,
-    document_id: str,
-    find_text: str,
-    replace_text: str,
+    user_google_email: str = "",
+    file_id: str = "",
+    find_text: str = "",
+    replace_text: str = "",
     match_case: bool = False,
 ) -> str:
-    """
-    Finds and replaces text throughout a Google Doc.
-
-    Args:
-        user_google_email: User's Google email address
-        document_id: ID of the document to update
-        find_text: Text to search for
-        replace_text: Text to replace with
-        match_case: Whether to match case exactly
-
-    Returns:
-        str: Confirmation message with replacement count
-    """
+    """Find and replace all occurrences of text in a Google Doc."""
     logger.info(
-        f"[find_and_replace_doc] Doc={document_id}, find='{find_text}', replace='{replace_text}'"
+        f"[find_and_replace_doc] Doc={file_id}, find='{find_text}', replace='{replace_text}'"
     )
 
     requests = [create_find_replace_request(find_text, replace_text, match_case)]
 
     result = await asyncio.to_thread(
         service.documents()
-        .batchUpdate(documentId=document_id, body={"requests": requests})
+        .batchUpdate(documentId=file_id, body={"requests": requests})
         .execute
     )
 
@@ -610,90 +550,95 @@ async def find_and_replace_doc(
         if "replaceAllText" in reply:
             replacements = reply["replaceAllText"].get("occurrencesChanged", 0)
 
-    link = f"https://docs.google.com/document/d/{document_id}/edit"
-    return f"Replaced {replacements} occurrence(s) of '{find_text}' with '{replace_text}' in document {document_id}. Link: {link}"
+    return f"Replaced {replacements} occurrence(s) of '{find_text}' with '{replace_text}'."
 
 
 @server.tool()
-@handle_http_errors("insert_doc_elements", service_type="docs")
+@handle_http_errors("insert_table", service_type="docs")
 @require_google_service("docs", "docs_write")
-async def insert_doc_elements(
+async def insert_table(
     service: Any,
-    user_google_email: str,
-    document_id: str,
-    element_type: str,
-    index: int,
-    rows: int = None,
-    columns: int = None,
-    list_type: str = None,
-    text: str = None,
+    user_google_email: str = "",
+    file_id: str = "",
+    index: int = 0,
+    rows: int = 0,
+    columns: int = 0,
 ) -> str:
-    """
-    Inserts structural elements like tables, lists, or page breaks into a Google Doc.
+    """Insert a table at the given index in a Google Doc."""
+    logger.info(f"[insert_table] Doc={file_id}, index={index}, rows={rows}, columns={columns}")
 
-    Args:
-        user_google_email: User's Google email address
-        document_id: ID of the document to update
-        element_type: Type of element to insert ("table", "list", "page_break")
-        index: Position to insert element (0-based)
-        rows: Number of rows for table (required for table)
-        columns: Number of columns for table (required for table)
-        list_type: Type of list ("UNORDERED", "ORDERED") (required for list)
-        text: Initial text content for list items
+    if not rows or not columns:
+        return "Error: 'rows' and 'columns' are required."
 
-    Returns:
-        str: Confirmation message with insertion details
-    """
-    logger.info(
-        f"[insert_doc_elements] Doc={document_id}, type={element_type}, index={index}"
-    )
-
-    # Handle the special case where we can't insert at the first section break
-    # If index is 0, bump it to 1 to avoid the section break
     if index == 0:
-        logger.debug("Adjusting index from 0 to 1 to avoid first section break")
         index = 1
 
-    requests = []
-
-    if element_type == "table":
-        if not rows or not columns:
-            return "Error: 'rows' and 'columns' parameters are required for table insertion."
-
-        requests.append(create_insert_table_request(index, rows, columns))
-        description = f"table ({rows}x{columns})"
-
-    elif element_type == "list":
-        if not list_type:
-            return "Error: 'list_type' parameter is required for list insertion ('UNORDERED' or 'ORDERED')."
-
-        if not text:
-            text = "List item"
-
-        # Insert text first, then create list
-        requests.extend(
-            [
-                create_insert_text_request(index, text + "\n"),
-                create_bullet_list_request(index, index + len(text), list_type),
-            ]
-        )
-        description = f"{list_type.lower()} list"
-
-    elif element_type == "page_break":
-        requests.append(create_insert_page_break_request(index))
-        description = "page break"
-
-    else:
-        return f"Error: Unsupported element type '{element_type}'. Supported types: 'table', 'list', 'page_break'."
+    requests = [create_insert_table_request(index, rows, columns)]
 
     await asyncio.to_thread(
         service.documents()
-        .batchUpdate(documentId=document_id, body={"requests": requests})
+        .batchUpdate(documentId=file_id, body={"requests": requests})
         .execute
     )
 
-    link = f"https://docs.google.com/document/d/{document_id}/edit"
-    return f"Inserted {description} at index {index} in document {document_id}. Link: {link}"
+    return f"Inserted table ({rows}x{columns}) at index {index}."
+
+
+@server.tool()
+@handle_http_errors("insert_list", service_type="docs")
+@require_google_service("docs", "docs_write")
+async def insert_list(
+    service: Any,
+    user_google_email: str = "",
+    file_id: str = "",
+    index: int = 0,
+    list_type: str = "UNORDERED",
+    text: str = "List item",
+) -> str:
+    """Insert a bullet or numbered list. list_type: UNORDERED or ORDERED."""
+    logger.info(f"[insert_list] Doc={file_id}, index={index}, list_type={list_type}")
+
+    if index == 0:
+        index = 1
+
+    requests = [
+        create_insert_text_request(index, text + "\n"),
+        create_bullet_list_request(index, index + len(text), list_type),
+    ]
+
+    await asyncio.to_thread(
+        service.documents()
+        .batchUpdate(documentId=file_id, body={"requests": requests})
+        .execute
+    )
+
+    return f"Inserted {list_type.lower()} list at index {index}."
+
+
+@server.tool()
+@handle_http_errors("insert_page_break", service_type="docs")
+@require_google_service("docs", "docs_write")
+async def insert_page_break(
+    service: Any,
+    user_google_email: str = "",
+    file_id: str = "",
+    index: int = 0,
+) -> str:
+    """Insert a page break at the given index in a Google Doc."""
+    logger.info(f"[insert_page_break] Doc={file_id}, index={index}")
+
+    if index == 0:
+        index = 1
+
+    requests = [create_insert_page_break_request(index)]
+
+    await asyncio.to_thread(
+        service.documents()
+        .batchUpdate(documentId=file_id, body={"requests": requests})
+        .execute
+    )
+
+    return f"Inserted page break at index {index}."
 
 
 @server.tool()
@@ -711,29 +656,16 @@ async def insert_doc_elements(
 async def insert_doc_image(
     docs_service: Any,
     drive_service: Any,
-    user_google_email: str,
-    document_id: str,
-    image_source: str,
-    index: int,
+    user_google_email: str = "",
+    file_id: str = "",
+    image_source: str = "",
+    index: int = 0,
     width: int = 0,
     height: int = 0,
 ) -> str:
-    """
-    Inserts an image into a Google Doc from Drive or a URL.
-
-    Args:
-        user_google_email: User's Google email address
-        document_id: ID of the document to update
-        image_source: Drive file ID or public image URL
-        index: Position to insert image (0-based)
-        width: Image width in points (optional)
-        height: Image height in points (optional)
-
-    Returns:
-        str: Confirmation message with insertion details
-    """
+    """Insert an image into a Google Doc from a Drive file ID or public URL."""
     logger.info(
-        f"[insert_doc_image] Doc={document_id}, source={image_source}, index={index}"
+        f"[insert_doc_image] Doc={file_id}, source={image_source}, index={index}"
     )
 
     # Handle the special case where we can't insert at the first section break
@@ -776,7 +708,7 @@ async def insert_doc_image(
 
     await asyncio.to_thread(
         docs_service.documents()
-        .batchUpdate(documentId=document_id, body={"requests": requests})
+        .batchUpdate(documentId=file_id, body={"requests": requests})
         .execute
     )
 
@@ -784,8 +716,7 @@ async def insert_doc_image(
     if width or height:
         size_info = f" (size: {width or 'auto'}x{height or 'auto'} points)"
 
-    link = f"https://docs.google.com/document/d/{document_id}/edit"
-    return f"Inserted {source_description}{size_info} at index {index} in document {document_id}. Link: {link}"
+    return f"Inserted {source_description}{size_info} at index {index}."
 
 
 @server.tool()
@@ -793,31 +724,19 @@ async def insert_doc_image(
 @require_google_service("docs", "docs_write")
 async def update_doc_headers_footers(
     service: Any,
-    user_google_email: str,
-    document_id: str,
-    section_type: str,
-    content: str,
+    user_google_email: str = "",
+    file_id: str = "",
+    section_type: str = "",
+    content: str = "",
     header_footer_type: str = "DEFAULT",
 ) -> str:
-    """
-    Updates headers or footers in a Google Doc.
-
-    Args:
-        user_google_email: User's Google email address
-        document_id: ID of the document to update
-        section_type: Type of section to update ("header" or "footer")
-        content: Text content for the header/footer
-        header_footer_type: Type of header/footer ("DEFAULT", "FIRST_PAGE_ONLY", "EVEN_PAGE")
-
-    Returns:
-        str: Confirmation message with update details
-    """
-    logger.info(f"[update_doc_headers_footers] Doc={document_id}, type={section_type}")
+    """Update headers or footers in a Google Doc. section_type: "header" or "footer". header_footer_type: "DEFAULT", "FIRST_PAGE_ONLY", or "EVEN_PAGE"."""
+    logger.info(f"[update_doc_headers_footers] Doc={file_id}, type={section_type}")
 
     # Input validation
     validator = ValidationManager()
 
-    is_valid, error_msg = validator.validate_document_id(document_id)
+    is_valid, error_msg = validator.validate_document_id(file_id)
     if not is_valid:
         return f"Error: {error_msg}"
 
@@ -835,12 +754,11 @@ async def update_doc_headers_footers(
     header_footer_manager = HeaderFooterManager(service)
 
     success, message = await header_footer_manager.update_header_footer_content(
-        document_id, section_type, content, header_footer_type
+        file_id, section_type, content, header_footer_type
     )
 
     if success:
-        link = f"https://docs.google.com/document/d/{document_id}/edit"
-        return f"{message}. Link: {link}"
+        return message
     else:
         return f"Error: {message}"
 
@@ -850,36 +768,17 @@ async def update_doc_headers_footers(
 @require_google_service("docs", "docs_write")
 async def batch_update_doc(
     service: Any,
-    user_google_email: str,
-    document_id: str,
-    operations: List[Dict[str, Any]],
+    user_google_email: str = "",
+    file_id: str = "",
+    operations: List[Dict[str, Any]] = None,
 ) -> str:
-    """
-    Executes multiple document operations in a single atomic batch update.
-
-    Args:
-        user_google_email: User's Google email address
-        document_id: ID of the document to update
-        operations: List of operation dictionaries. Each operation should contain:
-                   - type: Operation type ('insert_text', 'delete_text', 'replace_text', 'format_text', 'insert_table', 'insert_page_break')
-                   - Additional parameters specific to each operation type
-
-    Example operations:
-        [
-            {"type": "insert_text", "index": 1, "text": "Hello World"},
-            {"type": "format_text", "start_index": 1, "end_index": 12, "bold": true},
-            {"type": "insert_table", "index": 20, "rows": 2, "columns": 3}
-        ]
-
-    Returns:
-        str: Confirmation message with batch operation results
-    """
-    logger.debug(f"[batch_update_doc] Doc={document_id}, operations={len(operations)}")
+    """Execute multiple document operations in a single atomic batch. Each op needs a 'type' key (insert_text, delete_text, replace_text, format_text, insert_table, insert_page_break, find_replace, update_paragraph_style, insert_section_break)."""
+    logger.debug(f"[batch_update_doc] Doc={file_id}, operations={len(operations)}")
 
     # Input validation
     validator = ValidationManager()
 
-    is_valid, error_msg = validator.validate_document_id(document_id)
+    is_valid, error_msg = validator.validate_document_id(file_id)
     if not is_valid:
         return f"Error: {error_msg}"
 
@@ -891,13 +790,12 @@ async def batch_update_doc(
     batch_manager = BatchOperationManager(service)
 
     success, message, metadata = await batch_manager.execute_batch_operations(
-        document_id, operations
+        file_id, operations
     )
 
     if success:
-        link = f"https://docs.google.com/document/d/{document_id}/edit"
         replies_count = metadata.get("replies_count", 0)
-        return f"{message} on document {document_id}. API replies: {replies_count}. Link: {link}"
+        return f"{message}. API replies: {replies_count}."
     else:
         return f"Error: {message}"
 
@@ -907,47 +805,16 @@ async def batch_update_doc(
 @require_google_service("docs", "docs_read")
 async def inspect_doc_structure(
     service: Any,
-    user_google_email: str,
-    document_id: str,
+    user_google_email: str = "",
+    file_id: str = "",
     detailed: bool = False,
 ) -> str:
-    """
-    Essential tool for finding safe insertion points and understanding document structure.
-
-    USE THIS FOR:
-    - Finding the correct index for table insertion
-    - Understanding document layout before making changes
-    - Locating existing tables and their positions
-    - Getting document statistics and complexity info
-
-    CRITICAL FOR TABLE OPERATIONS:
-    ALWAYS call this BEFORE creating tables to get a safe insertion index.
-
-    WHAT THE OUTPUT SHOWS:
-    - total_elements: Number of document elements
-    - total_length: Maximum safe index for insertion
-    - tables: Number of existing tables
-    - table_details: Position and dimensions of each table
-
-    WORKFLOW:
-    Step 1: Call this function
-    Step 2: Note the "total_length" value
-    Step 3: Use an index < total_length for table insertion
-    Step 4: Create your table
-
-    Args:
-        user_google_email: User's Google email address
-        document_id: ID of the document to inspect
-        detailed: Whether to return detailed structure information
-
-    Returns:
-        str: JSON string containing document structure and safe insertion indices
-    """
-    logger.debug(f"[inspect_doc_structure] Doc={document_id}, detailed={detailed}")
+    """Analyze document structure to find safe insertion indices and table positions. Use total_length for safe insertion. Call before table operations."""
+    logger.debug(f"[inspect_doc_structure] Doc={file_id}, detailed={detailed}")
 
     # Get the document
     doc = await asyncio.to_thread(
-        service.documents().get(documentId=document_id).execute
+        service.documents().get(documentId=file_id).execute
     )
 
     if detailed:
@@ -1026,8 +893,7 @@ async def inspect_doc_structure(
                     }
                 )
 
-    link = f"https://docs.google.com/document/d/{document_id}/edit"
-    return f"Document structure analysis for {document_id}:\n\n{json.dumps(result, indent=2)}\n\nLink: {link}"
+    return json.dumps(result, indent=2)
 
 
 @server.tool()
@@ -1035,59 +901,19 @@ async def inspect_doc_structure(
 @require_google_service("docs", "docs_write")
 async def create_table_with_data(
     service: Any,
-    user_google_email: str,
-    document_id: str,
-    table_data: List[List[str]],
-    index: int,
+    user_google_email: str = "",
+    file_id: str = "",
+    table_data: List[List[str]] = None,
+    index: int = 0,
     bold_headers: bool = True,
 ) -> str:
-    """
-    Creates a table and populates it with data in one reliable operation.
-
-    CRITICAL: YOU MUST CALL inspect_doc_structure FIRST TO GET THE INDEX!
-
-    MANDATORY WORKFLOW - DO THESE STEPS IN ORDER:
-
-    Step 1: ALWAYS call inspect_doc_structure first
-    Step 2: Use the 'total_length' value from inspect_doc_structure as your index
-    Step 3: Format data as 2D list: [["col1", "col2"], ["row1col1", "row1col2"]]
-    Step 4: Call this function with the correct index and data
-
-    EXAMPLE DATA FORMAT:
-    table_data = [
-        ["Header1", "Header2", "Header3"],    # Row 0 - headers
-        ["Data1", "Data2", "Data3"],          # Row 1 - first data row
-        ["Data4", "Data5", "Data6"]           # Row 2 - second data row
-    ]
-
-    CRITICAL INDEX REQUIREMENTS:
-    - NEVER use index values like 1, 2, 10 without calling inspect_doc_structure first
-    - ALWAYS get index from inspect_doc_structure 'total_length' field
-    - Index must be a valid insertion point in the document
-
-    DATA FORMAT REQUIREMENTS:
-    - Must be 2D list of strings only
-    - Each inner list = one table row
-    - All rows MUST have same number of columns
-    - Use empty strings "" for empty cells, never None
-    - Use debug_table_structure after creation to verify results
-
-    Args:
-        user_google_email: User's Google email address
-        document_id: ID of the document to update
-        table_data: 2D list of strings - EXACT format: [["col1", "col2"], ["row1col1", "row1col2"]]
-        index: Document position (MANDATORY: get from inspect_doc_structure 'total_length')
-        bold_headers: Whether to make first row bold (default: true)
-
-    Returns:
-        str: Confirmation with table details and link
-    """
-    logger.debug(f"[create_table_with_data] Doc={document_id}, index={index}")
+    """Create and populate a table in one operation. Get index from inspect_doc_structure total_length. table_data: 2D list of strings, all rows same width, use "" for empty cells."""
+    logger.debug(f"[create_table_with_data] Doc={file_id}, index={index}")
 
     # Input validation
     validator = ValidationManager()
 
-    is_valid, error_msg = validator.validate_document_id(document_id)
+    is_valid, error_msg = validator.validate_document_id(file_id)
     if not is_valid:
         return f"ERROR: {error_msg}"
 
@@ -1104,7 +930,7 @@ async def create_table_with_data(
 
     # Try to create the table, and if it fails due to index being at document end, retry with index-1
     success, message, metadata = await table_manager.create_and_populate_table(
-        document_id, table_data, index, bold_headers
+        file_id, table_data, index, bold_headers
     )
 
     # If it failed due to index being at or beyond document end, retry with adjusted index
@@ -1113,17 +939,13 @@ async def create_table_with_data(
             f"Index {index} is at document boundary, retrying with index {index - 1}"
         )
         success, message, metadata = await table_manager.create_and_populate_table(
-            document_id, table_data, index - 1, bold_headers
+            file_id, table_data, index - 1, bold_headers
         )
 
     if success:
-        link = f"https://docs.google.com/document/d/{document_id}/edit"
         rows = metadata.get("rows", 0)
         columns = metadata.get("columns", 0)
-
-        return (
-            f"SUCCESS: {message}. Table: {rows}x{columns}, Index: {index}. Link: {link}"
-        )
+        return f"SUCCESS: {message}. Table: {rows}x{columns}."
     else:
         return f"ERROR: {message}"
 
@@ -1133,54 +955,18 @@ async def create_table_with_data(
 @require_google_service("docs", "docs_read")
 async def debug_table_structure(
     service: Any,
-    user_google_email: str,
-    document_id: str,
+    user_google_email: str = "",
+    file_id: str = "",
     table_index: int = 0,
 ) -> str:
-    """
-    ESSENTIAL DEBUGGING TOOL - Use this whenever tables don't work as expected.
-
-    USE THIS IMMEDIATELY WHEN:
-    - Table population put data in wrong cells
-    - You get "table not found" errors
-    - Data appears concatenated in first cell
-    - Need to understand existing table structure
-    - Planning to use populate_existing_table
-
-    WHAT THIS SHOWS YOU:
-    - Exact table dimensions (rows × columns)
-    - Each cell's position coordinates (row,col)
-    - Current content in each cell
-    - Insertion indices for each cell
-    - Table boundaries and ranges
-
-    HOW TO READ THE OUTPUT:
-    - "dimensions": "2x3" = 2 rows, 3 columns
-    - "position": "(0,0)" = first row, first column
-    - "current_content": What's actually in each cell right now
-    - "insertion_index": Where new text would be inserted in that cell
-
-    WORKFLOW INTEGRATION:
-    1. After creating table → Use this to verify structure
-    2. Before populating → Use this to plan your data format
-    3. After population fails → Use this to see what went wrong
-    4. When debugging → Compare your data array to actual table structure
-
-    Args:
-        user_google_email: User's Google email address
-        document_id: ID of the document to inspect
-        table_index: Which table to debug (0 = first table, 1 = second table, etc.)
-
-    Returns:
-        str: Detailed JSON structure showing table layout, cell positions, and current content
-    """
+    """Inspect a table's dimensions, cell positions, content, and insertion indices. Use after table creation or when debugging table issues."""
     logger.debug(
-        f"[debug_table_structure] Doc={document_id}, table_index={table_index}"
+        f"[debug_table_structure] Doc={file_id}, table_index={table_index}"
     )
 
     # Get the document
     doc = await asyncio.to_thread(
-        service.documents().get(documentId=document_id).execute
+        service.documents().get(documentId=file_id).execute
     )
 
     # Find tables
@@ -1211,8 +997,7 @@ async def debug_table_structure(
             row_info.append(cell_debug)
         debug_info["cells"].append(row_info)
 
-    link = f"https://docs.google.com/document/d/{document_id}/edit"
-    return f"Table structure debug for table {table_index}:\n\n{json.dumps(debug_info, indent=2)}\n\nLink: {link}"
+    return json.dumps(debug_info, indent=2)
 
 
 @server.tool()
@@ -1220,25 +1005,14 @@ async def debug_table_structure(
 @require_google_service("drive", "drive_file")
 async def export_doc_to_pdf(
     service: Any,
-    user_google_email: str,
-    document_id: str,
+    user_google_email: str = "",
+    file_id: str = "",
     pdf_filename: str = None,
     folder_id: str = None,
 ) -> str:
-    """
-    Exports a Google Doc to PDF format and saves it to Google Drive.
-
-    Args:
-        user_google_email: User's Google email address
-        document_id: ID of the Google Doc to export
-        pdf_filename: Name for the PDF file (optional - if not provided, uses original name + "_PDF")
-        folder_id: Drive folder ID to save PDF in (optional - if not provided, saves in root)
-
-    Returns:
-        str: Confirmation message with PDF file details and links
-    """
+    """Export a Google Doc to PDF and save to Drive. Returns new PDF file ID and link."""
     logger.info(
-        f"[export_doc_to_pdf] Email={user_google_email}, Doc={document_id}, pdf_filename={pdf_filename}, folder_id={folder_id}"
+        f"[export_doc_to_pdf] Doc={file_id}, pdf_filename={pdf_filename}, folder_id={folder_id}"
     )
 
     # Get file metadata first to validate it's a Google Doc
@@ -1246,14 +1020,14 @@ async def export_doc_to_pdf(
         file_metadata = await asyncio.to_thread(
             service.files()
             .get(
-                fileId=document_id,
+                fileId=file_id,
                 fields="id, name, mimeType, webViewLink",
                 supportsAllDrives=True,
             )
             .execute
         )
     except Exception as e:
-        return f"Error: Could not access document {document_id}: {str(e)}"
+        return f"Error: Could not access document {file_id}: {str(e)}"
 
     mime_type = file_metadata.get("mimeType", "")
     original_name = file_metadata.get("name", "Unknown Document")
@@ -1268,7 +1042,7 @@ async def export_doc_to_pdf(
     # Export the document as PDF
     try:
         request_obj = service.files().export_media(
-            fileId=document_id, mimeType="application/pdf"
+            fileId=file_id, mimeType="application/pdf"
         )
 
         fh = io.BytesIO()
@@ -1324,13 +1098,7 @@ async def export_doc_to_pdf(
             f"[export_doc_to_pdf] Successfully uploaded PDF to Drive: {pdf_file_id}"
         )
 
-        folder_info = ""
-        if folder_id:
-            folder_info = f" in folder {folder_id}"
-        elif pdf_parents:
-            folder_info = f" in folder {pdf_parents[0]}"
-
-        return f"Successfully exported '{original_name}' to PDF and saved to Drive as '{pdf_filename}' (ID: {pdf_file_id}, {pdf_size:,} bytes){folder_info}. PDF: {pdf_web_link} | Original: {web_view_link}"
+        return f"Exported to PDF '{pdf_filename}' (ID: {pdf_file_id}, {pdf_size:,} bytes). Link: {pdf_web_link}"
 
     except Exception as e:
         return f"Error: Failed to upload PDF to Drive: {str(e)}. PDF was generated successfully ({pdf_size:,} bytes) but could not be saved to Drive."
@@ -1341,10 +1109,10 @@ async def export_doc_to_pdf(
 @require_google_service("docs", "docs_write")
 async def update_paragraph_style(
     service: Any,
-    user_google_email: str,
-    document_id: str,
-    start_index: int,
-    end_index: int,
+    user_google_email: str = "",
+    file_id: str = "",
+    start_index: int = 0,
+    end_index: int = 0,
     heading_type: str = None,
     alignment: str = None,
     line_spacing: float = None,
@@ -1354,32 +1122,13 @@ async def update_paragraph_style(
     indent_start: float = None,
     indent_end: float = None,
 ) -> str:
-    """
-    Applies paragraph-level formatting to a range in a Google Doc.
-
-    Args:
-        user_google_email: User's Google email address
-        document_id: ID of the document to update
-        start_index: Start position of the paragraph range
-        end_index: End position of the paragraph range
-        heading_type: Paragraph style type - one of "NORMAL_TEXT", "HEADING_1" through "HEADING_6", "TITLE", "SUBTITLE"
-        alignment: Text alignment - one of "START", "CENTER", "END", "JUSTIFIED"
-        line_spacing: Line spacing as percentage (e.g., 115 for 1.15x spacing)
-        space_above: Space above paragraph in points
-        space_below: Space below paragraph in points
-        indent_first_line: First line indent in points
-        indent_start: Left indent in points (for LTR text)
-        indent_end: Right indent in points (for LTR text)
-
-    Returns:
-        str: Confirmation message with operation details
-    """
+    """Apply paragraph-level formatting to a range. heading_type: NORMAL_TEXT, HEADING_1-6, TITLE, SUBTITLE. alignment: START, CENTER, END, JUSTIFIED."""
     logger.info(
-        f"[update_paragraph_style] Doc={document_id}, range={start_index}-{end_index}"
+        f"[update_paragraph_style] Doc={file_id}, range={start_index}-{end_index}"
     )
 
     validator = ValidationManager()
-    is_valid, error_msg = validator.validate_document_id(document_id)
+    is_valid, error_msg = validator.validate_document_id(file_id)
     if not is_valid:
         return f"Error: {error_msg}"
 
@@ -1428,13 +1177,12 @@ async def update_paragraph_style(
 
     await asyncio.to_thread(
         service.documents()
-        .batchUpdate(documentId=document_id, body={"requests": [request]})
+        .batchUpdate(documentId=file_id, body={"requests": [request]})
         .execute
     )
 
-    link = f"https://docs.google.com/document/d/{document_id}/edit"
     style_details = ", ".join(f"{f}={paragraph_style.get(f, paragraph_style.get(f))}" for f in fields)
-    return f"Applied paragraph style ({style_details}) to range {start_index}-{end_index} in document {document_id}. Link: {link}"
+    return f"Applied paragraph style ({style_details}) to range {start_index}-{end_index}."
 
 
 @server.tool()
@@ -1442,8 +1190,8 @@ async def update_paragraph_style(
 @require_google_service("docs", "docs_write")
 async def update_document_style(
     service: Any,
-    user_google_email: str,
-    document_id: str,
+    user_google_email: str = "",
+    file_id: str = "",
     margin_top: float = None,
     margin_bottom: float = None,
     margin_left: float = None,
@@ -1453,28 +1201,11 @@ async def update_document_style(
     default_font_family: str = None,
     default_font_size: float = None,
 ) -> str:
-    """
-    Sets page-level document style defaults for a Google Doc.
-
-    Args:
-        user_google_email: User's Google email address
-        document_id: ID of the document to update
-        margin_top: Top margin in points
-        margin_bottom: Bottom margin in points
-        margin_left: Left margin in points
-        margin_right: Right margin in points
-        page_width: Page width in points (US Letter = 612)
-        page_height: Page height in points (US Letter = 792)
-        default_font_family: Default font family name
-        default_font_size: Default font size in points
-
-    Returns:
-        str: Confirmation message with operation details
-    """
-    logger.info(f"[update_document_style] Doc={document_id}")
+    """Set page-level defaults (margins, page size, default font) for a Google Doc. Dimensions in points (US Letter: 612x792)."""
+    logger.info(f"[update_document_style] Doc={file_id}")
 
     validator = ValidationManager()
-    is_valid, error_msg = validator.validate_document_id(document_id)
+    is_valid, error_msg = validator.validate_document_id(file_id)
     if not is_valid:
         return f"Error: {error_msg}"
 
@@ -1534,11 +1265,10 @@ async def update_document_style(
 
     await asyncio.to_thread(
         service.documents()
-        .batchUpdate(documentId=document_id, body={"requests": requests})
+        .batchUpdate(documentId=file_id, body={"requests": requests})
         .execute
     )
 
-    link = f"https://docs.google.com/document/d/{document_id}/edit"
     changes = []
     if margin_top is not None:
         changes.append(f"margin_top={margin_top}pt")
@@ -1556,7 +1286,7 @@ async def update_document_style(
         changes.append(f"font_family={default_font_family}")
     if default_font_size is not None:
         changes.append(f"font_size={default_font_size}pt")
-    return f"Updated document style ({', '.join(changes)}) for document {document_id}. Link: {link}"
+    return f"Updated document style ({', '.join(changes)})."
 
 
 @server.tool()
@@ -1564,37 +1294,22 @@ async def update_document_style(
 @require_google_service("docs", "docs_write")
 async def manage_named_range(
     service: Any,
-    user_google_email: str,
-    document_id: str,
-    action: str,
-    name: str,
+    user_google_email: str = "",
+    file_id: str = "",
+    action: str = "",
+    name: str = "",
     start_index: int = None,
     end_index: int = None,
     named_range_id: str = None,
     replacement_text: str = None,
 ) -> str:
-    """
-    Creates, deletes, or replaces content in named ranges in a Google Doc.
-
-    Args:
-        user_google_email: User's Google email address
-        document_id: ID of the document to update
-        action: Action to perform - "create", "delete", or "replace_content"
-        name: Name of the named range
-        start_index: Start position for creating a named range
-        end_index: End position for creating a named range
-        named_range_id: ID of the named range (for delete action)
-        replacement_text: Text to replace the named range content with (for replace_content action)
-
-    Returns:
-        str: Confirmation message with operation details
-    """
+    """Create, delete, or replace content in named ranges. action: "create", "delete", or "replace_content"."""
     logger.info(
-        f"[manage_named_range] Doc={document_id}, action={action}, name={name}"
+        f"[manage_named_range] Doc={file_id}, action={action}, name={name}"
     )
 
     validator = ValidationManager()
-    is_valid, error_msg = validator.validate_document_id(document_id)
+    is_valid, error_msg = validator.validate_document_id(file_id)
     if not is_valid:
         return f"Error: {error_msg}"
 
@@ -1633,11 +1348,9 @@ async def manage_named_range(
 
     result = await asyncio.to_thread(
         service.documents()
-        .batchUpdate(documentId=document_id, body={"requests": requests})
+        .batchUpdate(documentId=file_id, body={"requests": requests})
         .execute
     )
-
-    link = f"https://docs.google.com/document/d/{document_id}/edit"
 
     if action == "create":
         # Extract the created named range ID from the response
@@ -1646,11 +1359,11 @@ async def manage_named_range(
             reply = result["replies"][0]
             if "createNamedRange" in reply:
                 range_id = reply["createNamedRange"].get("namedRangeId", "")
-        return f"Created named range '{name}' (ID: {range_id}) at {start_index}-{end_index} in document {document_id}. Link: {link}"
+        return f"Created named range '{name}' (ID: {range_id}) at {start_index}-{end_index}."
     elif action == "delete":
-        return f"Deleted named range '{name}' from document {document_id}. Link: {link}"
+        return f"Deleted named range '{name}'."
     else:
-        return f"Replaced content of named range '{name}' with '{replacement_text[:50]}{'...' if len(replacement_text) > 50 else ''}' in document {document_id}. Link: {link}"
+        return f"Replaced content of named range '{name}'."
 
 
 @server.tool()
@@ -1658,10 +1371,10 @@ async def manage_named_range(
 @require_google_service("docs", "docs_write")
 async def manage_table_structure(
     service: Any,
-    user_google_email: str,
-    document_id: str,
-    action: str,
-    table_start_index: int,
+    user_google_email: str = "",
+    file_id: str = "",
+    action: str = "",
+    table_start_index: int = 0,
     row_index: int = None,
     column_index: int = None,
     insert_below: bool = True,
@@ -1671,32 +1384,13 @@ async def manage_table_structure(
     start_column: int = None,
     end_column: int = None,
 ) -> str:
-    """
-    Modifies table structure in a Google Doc - insert/delete rows/columns, merge/unmerge cells.
-
-    Args:
-        user_google_email: User's Google email address
-        document_id: ID of the document to update
-        action: Action to perform - "insert_row", "insert_column", "delete_row", "delete_column", "merge_cells", "unmerge_cells"
-        table_start_index: The start index of the table in the document
-        row_index: Row index for insert/delete row operations
-        column_index: Column index for insert/delete column operations
-        insert_below: Whether to insert row below the specified index (default: True)
-        insert_right: Whether to insert column to the right of the specified index (default: True)
-        start_row: Start row for merge/unmerge operations
-        end_row: End row for merge/unmerge operations (exclusive)
-        start_column: Start column for merge/unmerge operations
-        end_column: End column for merge/unmerge operations (exclusive)
-
-    Returns:
-        str: Confirmation message with operation details
-    """
+    """Modify table structure: insert/delete rows/columns, merge/unmerge cells. action: insert_row, insert_column, delete_row, delete_column, merge_cells, unmerge_cells."""
     logger.info(
-        f"[manage_table_structure] Doc={document_id}, action={action}, table_start={table_start_index}"
+        f"[manage_table_structure] Doc={file_id}, action={action}, table_start={table_start_index}"
     )
 
     validator = ValidationManager()
-    is_valid, error_msg = validator.validate_document_id(document_id)
+    is_valid, error_msg = validator.validate_document_id(file_id)
     if not is_valid:
         return f"Error: {error_msg}"
 
@@ -1777,12 +1471,11 @@ async def manage_table_structure(
 
     await asyncio.to_thread(
         service.documents()
-        .batchUpdate(documentId=document_id, body={"requests": requests})
+        .batchUpdate(documentId=file_id, body={"requests": requests})
         .execute
     )
 
-    link = f"https://docs.google.com/document/d/{document_id}/edit"
-    return f"Successfully performed '{action}' on table at index {table_start_index} in document {document_id}. Link: {link}"
+    return f"Performed '{action}' on table at index {table_start_index}."
 
 
 @server.tool()
@@ -1790,29 +1483,18 @@ async def manage_table_structure(
 @require_google_service("docs", "docs_write")
 async def insert_section_break(
     service: Any,
-    user_google_email: str,
-    document_id: str,
-    index: int,
+    user_google_email: str = "",
+    file_id: str = "",
+    index: int = 0,
     section_type: str = "NEXT_PAGE",
 ) -> str:
-    """
-    Inserts a section break into a Google Doc.
-
-    Args:
-        user_google_email: User's Google email address
-        document_id: ID of the document to update
-        index: Position to insert the section break
-        section_type: Type of section break - "CONTINUOUS" or "NEXT_PAGE" (default: "NEXT_PAGE")
-
-    Returns:
-        str: Confirmation message with operation details
-    """
+    """Insert a section break. section_type: "CONTINUOUS" or "NEXT_PAGE"."""
     logger.info(
-        f"[insert_section_break] Doc={document_id}, index={index}, type={section_type}"
+        f"[insert_section_break] Doc={file_id}, index={index}, type={section_type}"
     )
 
     validator = ValidationManager()
-    is_valid, error_msg = validator.validate_document_id(document_id)
+    is_valid, error_msg = validator.validate_document_id(file_id)
     if not is_valid:
         return f"Error: {error_msg}"
 
@@ -1831,12 +1513,11 @@ async def insert_section_break(
 
     await asyncio.to_thread(
         service.documents()
-        .batchUpdate(documentId=document_id, body={"requests": [request]})
+        .batchUpdate(documentId=file_id, body={"requests": [request]})
         .execute
     )
 
-    link = f"https://docs.google.com/document/d/{document_id}/edit"
-    return f"Inserted {section_type} section break at index {index} in document {document_id}. Link: {link}"
+    return f"Inserted {section_type} section break at index {index}."
 
 
 @server.tool()
@@ -1844,29 +1525,18 @@ async def insert_section_break(
 @require_google_service("docs", "docs_write")
 async def insert_footnote(
     service: Any,
-    user_google_email: str,
-    document_id: str,
-    index: int,
+    user_google_email: str = "",
+    file_id: str = "",
+    index: int = 0,
     footnote_text: str = None,
 ) -> str:
-    """
-    Inserts a footnote reference at the specified position in a Google Doc, optionally with text.
-
-    Args:
-        user_google_email: User's Google email address
-        document_id: ID of the document to update
-        index: Position to insert the footnote reference
-        footnote_text: Optional text to add to the footnote body
-
-    Returns:
-        str: Confirmation message with operation details
-    """
+    """Insert a footnote reference at the given index, optionally with body text."""
     logger.info(
-        f"[insert_footnote] Doc={document_id}, index={index}, has_text={footnote_text is not None}"
+        f"[insert_footnote] Doc={file_id}, index={index}, has_text={footnote_text is not None}"
     )
 
     validator = ValidationManager()
-    is_valid, error_msg = validator.validate_document_id(document_id)
+    is_valid, error_msg = validator.validate_document_id(file_id)
     if not is_valid:
         return f"Error: {error_msg}"
 
@@ -1882,7 +1552,7 @@ async def insert_footnote(
 
     result = await asyncio.to_thread(
         service.documents()
-        .batchUpdate(documentId=document_id, body={"requests": [create_request]})
+        .batchUpdate(documentId=file_id, body={"requests": [create_request]})
         .execute
     )
 
@@ -1896,7 +1566,7 @@ async def insert_footnote(
     if footnote_text and footnote_id:
         # Get the document to find the footnote content element index
         doc = await asyncio.to_thread(
-            service.documents().get(documentId=document_id).execute
+            service.documents().get(documentId=file_id).execute
         )
 
         footnotes = doc.get("footnotes", {})
@@ -1921,13 +1591,11 @@ async def insert_footnote(
 
                 await asyncio.to_thread(
                     service.documents()
-                    .batchUpdate(documentId=document_id, body={"requests": [insert_request]})
+                    .batchUpdate(documentId=file_id, body={"requests": [insert_request]})
                     .execute
                 )
 
-    link = f"https://docs.google.com/document/d/{document_id}/edit"
-    text_info = f" with text '{footnote_text[:50]}{'...' if len(footnote_text) > 50 else ''}'" if footnote_text else ""
-    return f"Inserted footnote{text_info} at index {index} (footnote ID: {footnote_id}) in document {document_id}. Link: {link}"
+    return f"Inserted footnote at index {index} (footnote ID: {footnote_id})."
 
 
 @server.tool()
@@ -1935,27 +1603,17 @@ async def insert_footnote(
 @require_google_service("docs", "docs_write")
 async def delete_positioned_object(
     service: Any,
-    user_google_email: str,
-    document_id: str,
-    object_id: str,
+    user_google_email: str = "",
+    file_id: str = "",
+    object_id: str = "",
 ) -> str:
-    """
-    Deletes a positioned object (such as an image) from a Google Doc.
-
-    Args:
-        user_google_email: User's Google email address
-        document_id: ID of the document to update
-        object_id: The ID of the positioned object to delete
-
-    Returns:
-        str: Confirmation message with operation details
-    """
+    """Delete a positioned object (e.g., image) from a Google Doc by its object ID."""
     logger.info(
-        f"[delete_positioned_object] Doc={document_id}, object_id={object_id}"
+        f"[delete_positioned_object] Doc={file_id}, object_id={object_id}"
     )
 
     validator = ValidationManager()
-    is_valid, error_msg = validator.validate_document_id(document_id)
+    is_valid, error_msg = validator.validate_document_id(file_id)
     if not is_valid:
         return f"Error: {error_msg}"
 
@@ -1970,16 +1628,15 @@ async def delete_positioned_object(
 
     await asyncio.to_thread(
         service.documents()
-        .batchUpdate(documentId=document_id, body={"requests": [request]})
+        .batchUpdate(documentId=file_id, body={"requests": [request]})
         .execute
     )
 
-    link = f"https://docs.google.com/document/d/{document_id}/edit"
-    return f"Deleted positioned object '{object_id}' from document {document_id}. Link: {link}"
+    return f"Deleted positioned object '{object_id}'."
 
 
 # Create comment management tools for documents
-_comment_tools = create_comment_tools("document", "document_id")
+_comment_tools = create_comment_tools("document", "file_id")  # file_id_param used in generated tool signatures
 
 # Extract and register the functions
 read_doc_comments = _comment_tools["read_comments"]

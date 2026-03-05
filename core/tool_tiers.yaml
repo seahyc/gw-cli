@@ -71,7 +71,9 @@ docs:
     - search_docs
     - find_and_replace_doc
     - list_docs_in_folder
-    - insert_doc_elements
+    - insert_table
+    - insert_list
+    - insert_page_break
   complete:
     - insert_doc_image
     - update_doc_headers_footers

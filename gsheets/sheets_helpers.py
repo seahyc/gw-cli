@@ -175,31 +175,12 @@ def _quote_sheet_title_for_a1(sheet_title: str) -> str:
 
 
 def _format_a1_cell(sheet_title: str, row_index: int, col_index: int) -> str:
-    """
-    Format a cell reference in A1 notation given a sheet title and zero-based row/column indices.
-
-    Args:
-        sheet_title: The title of the sheet.
-        row_index: Zero-based row index (0 for first row).
-        col_index: Zero-based column index (0 for column A).
-
-    Returns:
-        A string representing the cell reference in A1 notation, e.g., 'Sheet1!B2'.
-    """
+    """Format a cell reference in A1 notation from sheet title and zero-based row/col indices."""
     return f"{_quote_sheet_title_for_a1(sheet_title)}!{_index_to_column(col_index)}{row_index + 1}"
 
 
 def _coerce_int(value: object, default: int = 0) -> int:
-    """
-    Safely convert a value to an integer, returning a default value if conversion fails.
-
-    Args:
-        value: The value to convert to int.
-        default: The value to return if conversion fails (default is 0).
-
-    Returns:
-        The integer value of `value`, or `default` if conversion fails.
-    """
+    """Safely convert a value to int, returning default if conversion fails."""
     try:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
@@ -207,11 +188,7 @@ def _coerce_int(value: object, default: int = 0) -> int:
 
 
 def _is_sheets_error_token(value: object) -> bool:
-    """
-    Detect whether a cell value represents a Google Sheets error token (e.g., #ERROR!, #NAME?, #REF!, #N/A).
-
-    Returns True if the value is a string that starts with '#' and ends with '!' or '?', or is exactly '#N/A'.
-    """
+    """Detect whether a cell value is a Sheets error token (e.g., #ERROR!, #REF!, #N/A)."""
     if not isinstance(value, str):
         return False
     candidate = value.strip()
@@ -224,15 +201,7 @@ def _is_sheets_error_token(value: object) -> bool:
 
 
 def _values_contain_sheets_errors(values: List[List[object]]) -> bool:
-    """
-    Check whether a 2D array of cell values contains any Google Sheets error tokens.
-
-    Args:
-        values: A 2D list of cell values (as returned from the Sheets API).
-
-    Returns:
-        True if any cell contains a Google Sheets error token, False otherwise.
-    """
+    """Check whether a 2D array of cell values contains any Sheets error tokens."""
     for row in values:
         for cell in row:
             if _is_sheets_error_token(cell):
@@ -276,21 +245,7 @@ def _a1_range_for_values(a1_range: str, values: List[List[object]]) -> Optional[
 
 
 def _extract_cell_errors_from_grid(spreadsheet: dict) -> list[dict[str, Optional[str]]]:
-    """
-    Extracts error information from spreadsheet grid data.
-
-    Iterates through the sheets and their grid data in the provided spreadsheet dictionary,
-    collecting all cell errors. Returns a list of dictionaries, each containing:
-        - "cell": the A1 notation of the cell with the error,
-        - "type": the error type (e.g., "ERROR", "N/A"),
-        - "message": the error message, if available.
-
-    Args:
-        spreadsheet (dict): The spreadsheet data as returned by the Sheets API with grid data included.
-
-    Returns:
-        list[dict[str, Optional[str]]]: List of error details for each cell with an error.
-    """
+    """Extract cell error details (cell, type, message) from spreadsheet grid data."""
     errors: list[dict[str, Optional[str]]] = []
     for sheet in spreadsheet.get("sheets", []) or []:
         sheet_title = sheet.get("properties", {}).get("title") or "Unknown"
@@ -325,12 +280,12 @@ def _extract_cell_errors_from_grid(spreadsheet: dict) -> list[dict[str, Optional
 
 
 async def _fetch_detailed_sheet_errors(
-    service, spreadsheet_id: str, a1_range: str
+    service, file_id: str, a1_range: str
 ) -> list[dict[str, Optional[str]]]:
     response = await asyncio.to_thread(
         service.spreadsheets()
         .get(
-            spreadsheetId=spreadsheet_id,
+            spreadsheetId=file_id,
             ranges=[a1_range],
             includeGridData=True,
             fields="sheets(properties(title),data(startRow,startColumn,rowData(values(effectiveValue(errorValue(type,message))))))",
@@ -343,21 +298,7 @@ async def _fetch_detailed_sheet_errors(
 def _format_sheet_error_section(
     *, errors: list[dict[str, Optional[str]]], range_label: str, max_details: int = 25
 ) -> str:
-    """
-    Format a list of cell error information into a human-readable section.
-
-    Args:
-        errors: A list of dictionaries, each containing details about a cell error,
-            including the cell location, error type, and message.
-        range_label: A string label for the range in which the errors occurred.
-        max_details: The maximum number of error details to include in the output.
-            If the number of errors exceeds this value, the output will be truncated
-            and a summary line will indicate how many additional errors were omitted.
-
-    Returns:
-        A formatted string listing the cell errors in a human-readable format.
-        If there are no errors, returns an empty string.
-    """
+    """Format cell errors into a human-readable section, truncated to max_details."""
     # Limit the number of error details to 25 for performance and readability.
     if not errors:
         return ""
@@ -555,15 +496,13 @@ GRADIENT_POINT_TYPES = {"MIN", "MAX", "NUMBER", "PERCENT", "PERCENTILE"}
 
 
 async def _fetch_sheets_with_rules(
-    service, spreadsheet_id: str
+    service, file_id: str
 ) -> tuple[List[dict], dict[int, str]]:
-    """
-    Fetch sheets with titles and conditional format rules in a single request.
-    """
+    """Fetch sheets with titles and conditional format rules in a single request."""
     response = await asyncio.to_thread(
         service.spreadsheets()
         .get(
-            spreadsheetId=spreadsheet_id,
+            spreadsheetId=file_id,
             fields="sheets(properties(sheetId,title),conditionalFormats)",
         )
         .execute
@@ -732,25 +671,12 @@ def _build_boolean_rule(
     )
 
 
-async def _get_sheet_id_by_name(service, spreadsheet_id: str, sheet_name: str) -> int:
-    """
-    Look up a sheet's numeric sheetId by its tab name.
-
-    Args:
-        service: The authenticated Sheets API service.
-        spreadsheet_id: The spreadsheet ID.
-        sheet_name: The human-readable sheet tab name.
-
-    Returns:
-        The integer sheetId for the named sheet.
-
-    Raises:
-        UserInputError: If the sheet name is not found.
-    """
+async def _get_sheet_id_by_name(service, file_id: str, sheet_name: str) -> int:
+    """Look up a sheet's numeric sheetId by its tab name."""
     metadata = await asyncio.to_thread(
         service.spreadsheets()
         .get(
-            spreadsheetId=spreadsheet_id,
+            spreadsheetId=file_id,
             fields="sheets(properties(sheetId,title))",
         )
         .execute
