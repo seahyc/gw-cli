@@ -326,9 +326,17 @@ read_presentation_comments = _comment_tools["read_comments"]
 create_presentation_comment = _comment_tools["create_comment"]
 reply_to_presentation_comment = _comment_tools["reply_to_comment"]
 resolve_presentation_comment = _comment_tools["resolve_comment"]
+edit_presentation_comment = _comment_tools["edit_comment"]
+delete_presentation_comment = _comment_tools["delete_comment"]
+edit_presentation_comment_reply = _comment_tools["edit_reply"]
+delete_presentation_comment_reply = _comment_tools["delete_reply"]
 
 # Aliases for backwards compatibility and intuitive naming
 read_slide_comments = read_presentation_comments
 create_slide_comment = create_presentation_comment
 reply_to_slide_comment = reply_to_presentation_comment
 resolve_slide_comment = resolve_presentation_comment
+edit_slide_comment = edit_presentation_comment
+delete_slide_comment = delete_presentation_comment
+edit_slide_comment_reply = edit_presentation_comment_reply
+delete_slide_comment_reply = delete_presentation_comment_reply

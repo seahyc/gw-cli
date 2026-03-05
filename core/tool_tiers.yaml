@@ -75,6 +75,10 @@ docs:
     - create_document_comment
     - reply_to_document_comment
     - resolve_document_comment
+    - edit_document_comment
+    - delete_document_comment
+    - edit_document_comment_reply
+    - delete_document_comment_reply
 
 sheets:
   core:
@@ -94,6 +98,10 @@ sheets:
     - create_spreadsheet_comment
     - reply_to_spreadsheet_comment
     - resolve_spreadsheet_comment
+    - edit_spreadsheet_comment
+    - delete_spreadsheet_comment
+    - edit_spreadsheet_comment_reply
+    - delete_spreadsheet_comment_reply
 
 # chat: REMOVED FOR SECURITY - service disabled entirely
 # tasks: REMOVED FOR SECURITY - service disabled entirely
@@ -122,3 +130,7 @@ slides:
     - create_presentation_comment
     - reply_to_presentation_comment
     - resolve_presentation_comment
+    - edit_presentation_comment
+    - delete_presentation_comment
+    - edit_presentation_comment_reply
+    - delete_presentation_comment_reply
