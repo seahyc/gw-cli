@@ -227,6 +227,56 @@ class BatchOperationManager:
             )
             description = f"find/replace '{op['find_text']}' → '{op['replace_text']}'"
 
+        elif op_type == "update_paragraph_style":
+            paragraph_style = {}
+            ps_fields = []
+            if op.get("heading_type") is not None:
+                paragraph_style["namedStyleType"] = op["heading_type"]
+                ps_fields.append("namedStyleType")
+            if op.get("alignment") is not None:
+                paragraph_style["alignment"] = op["alignment"]
+                ps_fields.append("alignment")
+            if op.get("line_spacing") is not None:
+                paragraph_style["lineSpacing"] = op["line_spacing"]
+                ps_fields.append("lineSpacing")
+            if op.get("space_above") is not None:
+                paragraph_style["spaceAbove"] = {"magnitude": op["space_above"], "unit": "PT"}
+                ps_fields.append("spaceAbove")
+            if op.get("space_below") is not None:
+                paragraph_style["spaceBelow"] = {"magnitude": op["space_below"], "unit": "PT"}
+                ps_fields.append("spaceBelow")
+            if op.get("indent_first_line") is not None:
+                paragraph_style["indentFirstLine"] = {"magnitude": op["indent_first_line"], "unit": "PT"}
+                ps_fields.append("indentFirstLine")
+            if op.get("indent_start") is not None:
+                paragraph_style["indentStart"] = {"magnitude": op["indent_start"], "unit": "PT"}
+                ps_fields.append("indentStart")
+            if op.get("indent_end") is not None:
+                paragraph_style["indentEnd"] = {"magnitude": op["indent_end"], "unit": "PT"}
+                ps_fields.append("indentEnd")
+
+            if not ps_fields:
+                raise ValueError("No paragraph style options provided")
+
+            request = {
+                "updateParagraphStyle": {
+                    "range": {"startIndex": op["start_index"], "endIndex": op["end_index"]},
+                    "paragraphStyle": paragraph_style,
+                    "fields": ",".join(ps_fields),
+                }
+            }
+            description = f"update paragraph style {op['start_index']}-{op['end_index']} ({', '.join(ps_fields)})"
+
+        elif op_type == "insert_section_break":
+            section_type = op.get("section_type", "NEXT_PAGE")
+            request = {
+                "insertSectionBreak": {
+                    "location": {"index": op["index"]},
+                    "sectionType": section_type,
+                }
+            }
+            description = f"insert {section_type} section break at {op['index']}"
+
         else:
             supported_types = [
                 "insert_text",
@@ -236,6 +286,8 @@ class BatchOperationManager:
                 "insert_table",
                 "insert_page_break",
                 "find_replace",
+                "update_paragraph_style",
+                "insert_section_break",
             ]
             raise ValueError(
                 f"Unsupported operation type '{op_type}'. Supported: {', '.join(supported_types)}"
@@ -330,6 +382,25 @@ class BatchOperationManager:
                     "required": ["find_text", "replace_text"],
                     "optional": ["match_case"],
                     "description": "Find and replace text throughout document",
+                },
+                "update_paragraph_style": {
+                    "required": ["start_index", "end_index"],
+                    "optional": [
+                        "heading_type",
+                        "alignment",
+                        "line_spacing",
+                        "space_above",
+                        "space_below",
+                        "indent_first_line",
+                        "indent_start",
+                        "indent_end",
+                    ],
+                    "description": "Apply paragraph-level formatting to a range",
+                },
+                "insert_section_break": {
+                    "required": ["index"],
+                    "optional": ["section_type"],
+                    "description": "Insert a section break (CONTINUOUS or NEXT_PAGE)",
                 },
             },
             "example_operations": [

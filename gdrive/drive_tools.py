@@ -1079,3 +1079,523 @@ async def get_drive_shareable_link(
 # Read-only permission tools (get_drive_file_permissions, get_drive_shareable_link,
 # check_drive_file_public_access) are retained for visibility.
 # =============================================================================
+
+
+@server.tool()
+@handle_http_errors("copy_drive_file", service_type="drive")
+@require_google_service("drive", "drive_file")
+async def copy_drive_file(
+    service,
+    user_google_email: str,
+    file_id: str,
+    new_name: Optional[str] = None,
+    parent_folder_id: Optional[str] = None,
+) -> str:
+    """
+    Creates a copy of a Google Drive file.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        file_id (str): The ID of the file to copy. Required.
+        new_name (Optional[str]): Name for the copy. Defaults to "Copy of {original name}".
+        parent_folder_id (Optional[str]): Folder ID to place the copy in. If not specified, the copy is placed in the same folder as the original.
+
+    Returns:
+        str: Confirmation with the new file's ID and link.
+    """
+    logger.info(
+        f"[copy_drive_file] Invoked. Email: '{user_google_email}', File ID: '{file_id}'"
+    )
+
+    resolved_file_id, file_metadata = await resolve_drive_item(
+        service, file_id, extra_fields="name"
+    )
+    file_id = resolved_file_id
+    original_name = file_metadata.get("name", "Unknown File")
+
+    copy_body: Dict[str, Any] = {}
+    if new_name:
+        copy_body["name"] = new_name
+    if parent_folder_id:
+        resolved_parent = await resolve_folder_id(service, parent_folder_id)
+        copy_body["parents"] = [resolved_parent]
+
+    copied_file = await asyncio.to_thread(
+        service.files()
+        .copy(
+            fileId=file_id,
+            body=copy_body,
+            fields="id, name, webViewLink",
+            supportsAllDrives=True,
+        )
+        .execute
+    )
+
+    copy_name = copied_file.get("name", new_name or f"Copy of {original_name}")
+    copy_id = copied_file.get("id", "N/A")
+    link = copied_file.get("webViewLink", "#")
+
+    logger.info(f"[copy_drive_file] Successfully copied file. New ID: {copy_id}")
+    return (
+        f"Successfully copied '{original_name}' as '{copy_name}'\n"
+        f"New File ID: {copy_id}\n"
+        f"Link: {link}"
+    )
+
+
+@server.tool()
+@handle_http_errors("trash_drive_file", service_type="drive")
+@require_google_service("drive", "drive_file")
+async def trash_drive_file(
+    service,
+    user_google_email: str,
+    file_id: str,
+    untrash: bool = False,
+) -> str:
+    """
+    Moves a Google Drive file to the trash, or restores it from the trash.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        file_id (str): The ID of the file to trash or restore. Required.
+        untrash (bool): If True, restores the file from trash instead of trashing it. Defaults to False.
+
+    Returns:
+        str: Confirmation message with the file name and action taken.
+    """
+    action = "untrash" if untrash else "trash"
+    logger.info(
+        f"[trash_drive_file] Invoked. Email: '{user_google_email}', File ID: '{file_id}', Action: {action}"
+    )
+
+    resolved_file_id, file_metadata = await resolve_drive_item(
+        service, file_id, extra_fields="name"
+    )
+    file_id = resolved_file_id
+    file_name = file_metadata.get("name", "Unknown File")
+
+    updated_file = await asyncio.to_thread(
+        service.files()
+        .update(
+            fileId=file_id,
+            body={"trashed": not untrash},
+            fields="id, name, trashed, webViewLink",
+            supportsAllDrives=True,
+        )
+        .execute
+    )
+
+    if untrash:
+        logger.info(f"[trash_drive_file] Restored '{file_name}' from trash.")
+        return (
+            f"Successfully restored '{file_name}' from trash.\n"
+            f"File ID: {file_id}\n"
+            f"Link: {updated_file.get('webViewLink', '#')}"
+        )
+    else:
+        logger.info(f"[trash_drive_file] Moved '{file_name}' to trash.")
+        return (
+            f"Successfully moved '{file_name}' to trash.\n"
+            f"File ID: {file_id}\n"
+            f"To restore, call trash_drive_file with untrash=True."
+        )
+
+
+@server.tool()
+@handle_http_errors("delete_drive_file", service_type="drive")
+@require_google_service("drive", "drive_file")
+async def delete_drive_file(
+    service,
+    user_google_email: str,
+    file_id: str,
+) -> str:
+    """
+    PERMANENTLY deletes a Google Drive file. This action is irreversible - the file
+    cannot be recovered from trash. Use trash_drive_file instead if you want to
+    move the file to trash with the ability to restore it later.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        file_id (str): The ID of the file to permanently delete. Required.
+
+    Returns:
+        str: Confirmation that the file was permanently deleted.
+    """
+    logger.info(
+        f"[delete_drive_file] Invoked. Email: '{user_google_email}', File ID: '{file_id}'"
+    )
+
+    resolved_file_id, file_metadata = await resolve_drive_item(
+        service, file_id, extra_fields="name"
+    )
+    file_id = resolved_file_id
+    file_name = file_metadata.get("name", "Unknown File")
+
+    await asyncio.to_thread(
+        service.files()
+        .delete(fileId=file_id, supportsAllDrives=True)
+        .execute
+    )
+
+    logger.info(f"[delete_drive_file] Permanently deleted '{file_name}' ({file_id}).")
+    return (
+        f"Permanently deleted '{file_name}' (ID: {file_id}).\n"
+        f"This action is irreversible."
+    )
+
+
+@server.tool()
+@handle_http_errors("list_revisions", is_read_only=True, service_type="drive")
+@require_google_service("drive", "drive_read")
+async def list_revisions(
+    service,
+    user_google_email: str,
+    file_id: str,
+    max_results: int = 20,
+) -> str:
+    """
+    Lists the revision history of a Google Drive file.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        file_id (str): The ID of the file to list revisions for. Required.
+        max_results (int): Maximum number of revisions to return. Defaults to 20.
+
+    Returns:
+        str: A formatted list of revisions with author, timestamp, size, and revision ID.
+    """
+    logger.info(
+        f"[list_revisions] Invoked. Email: '{user_google_email}', File ID: '{file_id}'"
+    )
+
+    resolved_file_id, file_metadata = await resolve_drive_item(
+        service, file_id, extra_fields="name"
+    )
+    file_id = resolved_file_id
+    file_name = file_metadata.get("name", "Unknown File")
+
+    results = await asyncio.to_thread(
+        service.revisions()
+        .list(
+            fileId=file_id,
+            fields="revisions(id,modifiedTime,lastModifyingUser,size)",
+            pageSize=max_results,
+        )
+        .execute
+    )
+
+    revisions = results.get("revisions", [])
+    if not revisions:
+        return f"No revisions found for '{file_name}' (ID: {file_id})."
+
+    output_parts = [
+        f"Found {len(revisions)} revision(s) for '{file_name}' (ID: {file_id}):"
+    ]
+    for rev in revisions:
+        rev_id = rev.get("id", "N/A")
+        modified_time = rev.get("modifiedTime", "N/A")
+        size = rev.get("size", "N/A")
+        user_info = rev.get("lastModifyingUser", {})
+        author = user_info.get("displayName", user_info.get("emailAddress", "Unknown"))
+
+        size_str = f", Size: {size} bytes" if size != "N/A" else ""
+        output_parts.append(
+            f"- Revision {rev_id}: {modified_time} by {author}{size_str}"
+        )
+
+    return "\n".join(output_parts)
+
+
+@server.tool()
+@handle_http_errors("get_revision", is_read_only=True, service_type="drive")
+@require_google_service("drive", "drive_read")
+async def get_revision(
+    service,
+    user_google_email: str,
+    file_id: str,
+    revision_id: str,
+) -> str:
+    """
+    Gets detailed information about a specific revision of a Google Drive file.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        file_id (str): The ID of the file. Required.
+        revision_id (str): The ID of the specific revision to retrieve. Required.
+
+    Returns:
+        str: Full details of the specified revision.
+    """
+    logger.info(
+        f"[get_revision] Invoked. Email: '{user_google_email}', File ID: '{file_id}', Revision ID: '{revision_id}'"
+    )
+
+    resolved_file_id, file_metadata = await resolve_drive_item(
+        service, file_id, extra_fields="name"
+    )
+    file_id = resolved_file_id
+    file_name = file_metadata.get("name", "Unknown File")
+
+    revision = await asyncio.to_thread(
+        service.revisions()
+        .get(fileId=file_id, revisionId=revision_id, fields="*")
+        .execute
+    )
+
+    output_parts = [
+        f"Revision details for '{file_name}' (File ID: {file_id}):",
+        f"  Revision ID: {revision.get('id', 'N/A')}",
+        f"  Modified Time: {revision.get('modifiedTime', 'N/A')}",
+        f"  MIME Type: {revision.get('mimeType', 'N/A')}",
+        f"  Size: {revision.get('size', 'N/A')} bytes",
+    ]
+
+    user_info = revision.get("lastModifyingUser", {})
+    if user_info:
+        output_parts.append(
+            f"  Last Modified By: {user_info.get('displayName', 'Unknown')} "
+            f"({user_info.get('emailAddress', 'Unknown')})"
+        )
+
+    output_parts.extend(
+        [
+            f"  Keep Forever: {revision.get('keepForever', False)}",
+            f"  Published: {revision.get('published', False)}",
+        ]
+    )
+
+    export_links = revision.get("exportLinks", {})
+    if export_links:
+        output_parts.append("  Export Links:")
+        for fmt, link in export_links.items():
+            output_parts.append(f"    - {fmt}: {link}")
+
+    logger.info(f"[get_revision] Retrieved revision {revision_id} for file {file_id}.")
+    return "\n".join(output_parts)
+
+
+@server.tool()
+@handle_http_errors("export_drive_file", service_type="drive")
+@require_google_service("drive", "drive_file")
+async def export_drive_file(
+    service,
+    user_google_email: str,
+    file_id: str,
+    mime_type: str,
+    save_to_drive: bool = False,
+    save_name: Optional[str] = None,
+) -> str:
+    """
+    Exports a Google Workspace file (Docs, Sheets, Slides) to a specified format.
+
+    Common mime_type values:
+      - Google Docs: "application/pdf", "text/plain", "text/html",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" (docx)
+      - Google Sheets: "application/pdf", "text/csv",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" (xlsx)
+      - Google Slides: "application/pdf",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation" (pptx)
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        file_id (str): The ID of the Google Workspace file to export. Required.
+        mime_type (str): The target MIME type for export. Required.
+        save_to_drive (bool): If True, saves the exported content as a new file in Drive. Defaults to False.
+        save_name (Optional[str]): Name for the saved file when save_to_drive is True. Defaults to the original file name with an appropriate extension.
+
+    Returns:
+        str: Export summary (size, type) or confirmation of saved file with ID and link.
+    """
+    logger.info(
+        f"[export_drive_file] Invoked. Email: '{user_google_email}', File ID: '{file_id}', Target MIME: '{mime_type}'"
+    )
+
+    resolved_file_id, file_metadata = await resolve_drive_item(
+        service, file_id, extra_fields="name, parents"
+    )
+    file_id = resolved_file_id
+    file_name = file_metadata.get("name", "Unknown File")
+
+    exported_content = await asyncio.to_thread(
+        service.files()
+        .export(fileId=file_id, mimeType=mime_type)
+        .execute
+    )
+
+    # exported_content is bytes
+    if isinstance(exported_content, str):
+        exported_content = exported_content.encode("utf-8")
+
+    size_bytes = len(exported_content)
+    size_kb = size_bytes / 1024
+
+    if save_to_drive:
+        # Determine file name for the saved export
+        if not save_name:
+            ext_map = {
+                "application/pdf": ".pdf",
+                "text/plain": ".txt",
+                "text/html": ".html",
+                "text/csv": ".csv",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+            }
+            ext = ext_map.get(mime_type, "")
+            save_name = f"{Path(file_name).stem}{ext}" if ext else f"{file_name}_export"
+
+        parents = file_metadata.get("parents", [])
+        upload_metadata: Dict[str, Any] = {
+            "name": save_name,
+            "mimeType": mime_type,
+        }
+        if parents:
+            upload_metadata["parents"] = parents
+
+        media = MediaIoBaseUpload(
+            io.BytesIO(exported_content),
+            mimetype=mime_type,
+            resumable=True,
+        )
+
+        created_file = await asyncio.to_thread(
+            service.files()
+            .create(
+                body=upload_metadata,
+                media_body=media,
+                fields="id, name, webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute
+        )
+
+        new_id = created_file.get("id", "N/A")
+        link = created_file.get("webViewLink", "#")
+        logger.info(f"[export_drive_file] Saved export as '{save_name}' (ID: {new_id}).")
+        return (
+            f"Exported '{file_name}' to {mime_type} and saved to Drive.\n"
+            f"Saved File: '{save_name}' (ID: {new_id})\n"
+            f"Size: {size_kb:.1f} KB ({size_bytes} bytes)\n"
+            f"Link: {link}"
+        )
+    else:
+        logger.info(
+            f"[export_drive_file] Exported '{file_name}' - {size_kb:.1f} KB ({mime_type})."
+        )
+        return (
+            f"Exported '{file_name}' to {mime_type}.\n"
+            f"Size: {size_kb:.1f} KB ({size_bytes} bytes)\n"
+            f"Content type: {mime_type}\n"
+            f"Note: Content was exported but not saved. Set save_to_drive=True to save to Drive."
+        )
+
+
+@server.tool()
+@handle_http_errors("create_drive_folder", service_type="drive")
+@require_google_service("drive", "drive_file")
+async def create_drive_folder(
+    service,
+    user_google_email: str,
+    name: str,
+    parent_folder_id: Optional[str] = None,
+) -> str:
+    """
+    Creates a new folder in Google Drive.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        name (str): The name for the new folder. Required.
+        parent_folder_id (Optional[str]): The ID of the parent folder. If not specified, the folder is created in the root of My Drive.
+
+    Returns:
+        str: Confirmation with the new folder's ID and link.
+    """
+    logger.info(
+        f"[create_drive_folder] Invoked. Email: '{user_google_email}', Name: '{name}'"
+    )
+
+    folder_metadata: Dict[str, Any] = {
+        "name": name,
+        "mimeType": "application/vnd.google-apps.folder",
+    }
+
+    if parent_folder_id:
+        resolved_parent = await resolve_folder_id(service, parent_folder_id)
+        folder_metadata["parents"] = [resolved_parent]
+
+    created_folder = await asyncio.to_thread(
+        service.files()
+        .create(
+            body=folder_metadata,
+            fields="id, name, webViewLink",
+            supportsAllDrives=True,
+        )
+        .execute
+    )
+
+    folder_id = created_folder.get("id", "N/A")
+    link = created_folder.get("webViewLink", "#")
+    logger.info(f"[create_drive_folder] Created folder '{name}' (ID: {folder_id}).")
+    return (
+        f"Successfully created folder '{name}'.\n"
+        f"Folder ID: {folder_id}\n"
+        f"Link: {link}"
+    )
+
+
+@server.tool()
+@handle_http_errors("move_drive_file", service_type="drive")
+@require_google_service("drive", "drive_file")
+async def move_drive_file(
+    service,
+    user_google_email: str,
+    file_id: str,
+    destination_folder_id: str,
+) -> str:
+    """
+    Moves a Google Drive file to a different folder.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        file_id (str): The ID of the file to move. Required.
+        destination_folder_id (str): The ID of the target folder. Required.
+
+    Returns:
+        str: Confirmation message with the file name and new location.
+    """
+    logger.info(
+        f"[move_drive_file] Invoked. Email: '{user_google_email}', File ID: '{file_id}', Destination: '{destination_folder_id}'"
+    )
+
+    resolved_file_id, file_metadata = await resolve_drive_item(
+        service, file_id, extra_fields="name, parents"
+    )
+    file_id = resolved_file_id
+    file_name = file_metadata.get("name", "Unknown File")
+    current_parents = file_metadata.get("parents", [])
+
+    resolved_destination = await resolve_folder_id(service, destination_folder_id)
+
+    previous_parents = ",".join(current_parents) if current_parents else ""
+
+    updated_file = await asyncio.to_thread(
+        service.files()
+        .update(
+            fileId=file_id,
+            addParents=resolved_destination,
+            removeParents=previous_parents,
+            fields="id, name, parents, webViewLink",
+            supportsAllDrives=True,
+        )
+        .execute
+    )
+
+    link = updated_file.get("webViewLink", "#")
+    logger.info(
+        f"[move_drive_file] Moved '{file_name}' to folder '{resolved_destination}'."
+    )
+    return (
+        f"Successfully moved '{file_name}' to folder '{destination_folder_id}'.\n"
+        f"File ID: {file_id}\n"
+        f"Link: {link}"
+    )

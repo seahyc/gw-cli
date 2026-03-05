@@ -367,6 +367,10 @@ async def modify_doc_text(
     font_family: str = None,
     text_color: str = None,
     background_color: str = None,
+    strikethrough: bool = None,
+    superscript: bool = None,
+    subscript: bool = None,
+    link_url: str = None,
 ) -> str:
     """
     Modifies text in a Google Doc - can insert/replace text and/or apply formatting in a single operation.
@@ -384,13 +388,19 @@ async def modify_doc_text(
         font_family: Font family name (e.g., "Arial", "Times New Roman")
         text_color: Foreground text color (#RRGGBB)
         background_color: Background/highlight color (#RRGGBB)
+        strikethrough: Whether to apply strikethrough (True/False/None to leave unchanged)
+        superscript: Whether to make text superscript (True/False/None to leave unchanged)
+        subscript: Whether to make text subscript (True/False/None to leave unchanged)
+        link_url: URL to link the text to (string or None to leave unchanged)
 
     Returns:
         str: Confirmation message with operation details
     """
+    all_formatting = [bold, italic, underline, font_size, font_family, text_color,
+                       background_color, strikethrough, superscript, subscript, link_url]
     logger.info(
         f"[modify_doc_text] Doc={document_id}, start={start_index}, end={end_index}, text={text is not None}, "
-        f"formatting={any([bold, italic, underline, font_size, font_family, text_color, background_color])}"
+        f"formatting={any(p is not None for p in all_formatting)}"
     )
 
     # Input validation
@@ -400,8 +410,7 @@ async def modify_doc_text(
     if not is_valid:
         return f"Error: {error_msg}"
 
-    # Validate that we have something to do
-    if text is None and not any(
+    has_formatting = any(
         [
             bold is not None,
             italic is not None,
@@ -410,22 +419,19 @@ async def modify_doc_text(
             font_family,
             text_color,
             background_color,
+            strikethrough is not None,
+            superscript is not None,
+            subscript is not None,
+            link_url,
         ]
-    ):
-        return "Error: Must provide either 'text' to insert/replace, or formatting parameters (bold, italic, underline, font_size, font_family, text_color, background_color)."
+    )
+
+    # Validate that we have something to do
+    if text is None and not has_formatting:
+        return "Error: Must provide either 'text' to insert/replace, or formatting parameters (bold, italic, underline, strikethrough, superscript, subscript, link_url, font_size, font_family, text_color, background_color)."
 
     # Validate text formatting params if provided
-    if any(
-        [
-            bold is not None,
-            italic is not None,
-            underline is not None,
-            font_size,
-            font_family,
-            text_color,
-            background_color,
-        ]
-    ):
+    if has_formatting:
         is_valid, error_msg = validator.validate_text_formatting_params(
             bold,
             italic,
@@ -482,17 +488,7 @@ async def modify_doc_text(
             operations.append(f"Inserted text at index {start_index}")
 
     # Handle formatting
-    if any(
-        [
-            bold is not None,
-            italic is not None,
-            underline is not None,
-            font_size,
-            font_family,
-            text_color,
-            background_color,
-        ]
-    ):
+    if has_formatting:
         # Adjust range for formatting based on text operations
         format_start = start_index
         format_end = end_index
@@ -524,6 +520,10 @@ async def modify_doc_text(
                 font_family,
                 text_color,
                 background_color,
+                strikethrough,
+                superscript,
+                subscript,
+                link_url,
             )
         )
 
@@ -534,6 +534,14 @@ async def modify_doc_text(
             format_details.append(f"italic={italic}")
         if underline is not None:
             format_details.append(f"underline={underline}")
+        if strikethrough is not None:
+            format_details.append(f"strikethrough={strikethrough}")
+        if superscript is not None:
+            format_details.append(f"superscript={superscript}")
+        if subscript is not None:
+            format_details.append(f"subscript={subscript}")
+        if link_url:
+            format_details.append(f"link_url={link_url}")
         if font_size:
             format_details.append(f"font_size={font_size}")
         if font_family:
@@ -1326,6 +1334,648 @@ async def export_doc_to_pdf(
 
     except Exception as e:
         return f"Error: Failed to upload PDF to Drive: {str(e)}. PDF was generated successfully ({pdf_size:,} bytes) but could not be saved to Drive."
+
+
+@server.tool()
+@handle_http_errors("update_paragraph_style", service_type="docs")
+@require_google_service("docs", "docs_write")
+async def update_paragraph_style(
+    service: Any,
+    user_google_email: str,
+    document_id: str,
+    start_index: int,
+    end_index: int,
+    heading_type: str = None,
+    alignment: str = None,
+    line_spacing: float = None,
+    space_above: float = None,
+    space_below: float = None,
+    indent_first_line: float = None,
+    indent_start: float = None,
+    indent_end: float = None,
+) -> str:
+    """
+    Applies paragraph-level formatting to a range in a Google Doc.
+
+    Args:
+        user_google_email: User's Google email address
+        document_id: ID of the document to update
+        start_index: Start position of the paragraph range
+        end_index: End position of the paragraph range
+        heading_type: Paragraph style type - one of "NORMAL_TEXT", "HEADING_1" through "HEADING_6", "TITLE", "SUBTITLE"
+        alignment: Text alignment - one of "START", "CENTER", "END", "JUSTIFIED"
+        line_spacing: Line spacing as percentage (e.g., 115 for 1.15x spacing)
+        space_above: Space above paragraph in points
+        space_below: Space below paragraph in points
+        indent_first_line: First line indent in points
+        indent_start: Left indent in points (for LTR text)
+        indent_end: Right indent in points (for LTR text)
+
+    Returns:
+        str: Confirmation message with operation details
+    """
+    logger.info(
+        f"[update_paragraph_style] Doc={document_id}, range={start_index}-{end_index}"
+    )
+
+    validator = ValidationManager()
+    is_valid, error_msg = validator.validate_document_id(document_id)
+    if not is_valid:
+        return f"Error: {error_msg}"
+
+    is_valid, error_msg = validator.validate_index_range(start_index, end_index)
+    if not is_valid:
+        return f"Error: {error_msg}"
+
+    paragraph_style = {}
+    fields = []
+
+    if heading_type is not None:
+        paragraph_style["namedStyleType"] = heading_type
+        fields.append("namedStyleType")
+    if alignment is not None:
+        paragraph_style["alignment"] = alignment
+        fields.append("alignment")
+    if line_spacing is not None:
+        paragraph_style["lineSpacing"] = line_spacing
+        fields.append("lineSpacing")
+    if space_above is not None:
+        paragraph_style["spaceAbove"] = {"magnitude": space_above, "unit": "PT"}
+        fields.append("spaceAbove")
+    if space_below is not None:
+        paragraph_style["spaceBelow"] = {"magnitude": space_below, "unit": "PT"}
+        fields.append("spaceBelow")
+    if indent_first_line is not None:
+        paragraph_style["indentFirstLine"] = {"magnitude": indent_first_line, "unit": "PT"}
+        fields.append("indentFirstLine")
+    if indent_start is not None:
+        paragraph_style["indentStart"] = {"magnitude": indent_start, "unit": "PT"}
+        fields.append("indentStart")
+    if indent_end is not None:
+        paragraph_style["indentEnd"] = {"magnitude": indent_end, "unit": "PT"}
+        fields.append("indentEnd")
+
+    if not fields:
+        return "Error: Must provide at least one paragraph style parameter."
+
+    request = {
+        "updateParagraphStyle": {
+            "range": {"startIndex": start_index, "endIndex": end_index},
+            "paragraphStyle": paragraph_style,
+            "fields": ",".join(fields),
+        }
+    }
+
+    await asyncio.to_thread(
+        service.documents()
+        .batchUpdate(documentId=document_id, body={"requests": [request]})
+        .execute
+    )
+
+    link = f"https://docs.google.com/document/d/{document_id}/edit"
+    style_details = ", ".join(f"{f}={paragraph_style.get(f, paragraph_style.get(f))}" for f in fields)
+    return f"Applied paragraph style ({style_details}) to range {start_index}-{end_index} in document {document_id}. Link: {link}"
+
+
+@server.tool()
+@handle_http_errors("update_document_style", service_type="docs")
+@require_google_service("docs", "docs_write")
+async def update_document_style(
+    service: Any,
+    user_google_email: str,
+    document_id: str,
+    margin_top: float = None,
+    margin_bottom: float = None,
+    margin_left: float = None,
+    margin_right: float = None,
+    page_width: float = None,
+    page_height: float = None,
+    default_font_family: str = None,
+    default_font_size: float = None,
+) -> str:
+    """
+    Sets page-level document style defaults for a Google Doc.
+
+    Args:
+        user_google_email: User's Google email address
+        document_id: ID of the document to update
+        margin_top: Top margin in points
+        margin_bottom: Bottom margin in points
+        margin_left: Left margin in points
+        margin_right: Right margin in points
+        page_width: Page width in points (US Letter = 612)
+        page_height: Page height in points (US Letter = 792)
+        default_font_family: Default font family name
+        default_font_size: Default font size in points
+
+    Returns:
+        str: Confirmation message with operation details
+    """
+    logger.info(f"[update_document_style] Doc={document_id}")
+
+    validator = ValidationManager()
+    is_valid, error_msg = validator.validate_document_id(document_id)
+    if not is_valid:
+        return f"Error: {error_msg}"
+
+    requests = []
+
+    # Build document style request (margins and page size)
+    doc_style = {}
+    doc_fields = []
+
+    if margin_top is not None:
+        doc_style["marginTop"] = {"magnitude": margin_top, "unit": "PT"}
+        doc_fields.append("marginTop")
+    if margin_bottom is not None:
+        doc_style["marginBottom"] = {"magnitude": margin_bottom, "unit": "PT"}
+        doc_fields.append("marginBottom")
+    if margin_left is not None:
+        doc_style["marginLeft"] = {"magnitude": margin_left, "unit": "PT"}
+        doc_fields.append("marginLeft")
+    if margin_right is not None:
+        doc_style["marginRight"] = {"magnitude": margin_right, "unit": "PT"}
+        doc_fields.append("marginRight")
+    if page_width is not None:
+        doc_style.setdefault("pageSize", {})["width"] = {"magnitude": page_width, "unit": "PT"}
+        doc_fields.append("pageSize.width")
+    if page_height is not None:
+        doc_style.setdefault("pageSize", {})["height"] = {"magnitude": page_height, "unit": "PT"}
+        doc_fields.append("pageSize.height")
+
+    if doc_fields:
+        requests.append({
+            "updateDocumentStyle": {
+                "documentStyle": doc_style,
+                "fields": ",".join(doc_fields),
+            }
+        })
+
+    # Handle default font via named style update on NORMAL_TEXT
+    if default_font_family is not None or default_font_size is not None:
+        text_style = {}
+        style_fields = []
+        if default_font_family is not None:
+            text_style["weightedFontFamily"] = {"fontFamily": default_font_family}
+            style_fields.append("weightedFontFamily")
+        if default_font_size is not None:
+            text_style["fontSize"] = {"magnitude": default_font_size, "unit": "PT"}
+            style_fields.append("fontSize")
+
+        requests.append({
+            "updateTextStyle": {
+                "textStyle": text_style,
+                "fields": ",".join(style_fields),
+            }
+        })
+
+    if not requests:
+        return "Error: Must provide at least one document style parameter."
+
+    await asyncio.to_thread(
+        service.documents()
+        .batchUpdate(documentId=document_id, body={"requests": requests})
+        .execute
+    )
+
+    link = f"https://docs.google.com/document/d/{document_id}/edit"
+    changes = []
+    if margin_top is not None:
+        changes.append(f"margin_top={margin_top}pt")
+    if margin_bottom is not None:
+        changes.append(f"margin_bottom={margin_bottom}pt")
+    if margin_left is not None:
+        changes.append(f"margin_left={margin_left}pt")
+    if margin_right is not None:
+        changes.append(f"margin_right={margin_right}pt")
+    if page_width is not None:
+        changes.append(f"page_width={page_width}pt")
+    if page_height is not None:
+        changes.append(f"page_height={page_height}pt")
+    if default_font_family is not None:
+        changes.append(f"font_family={default_font_family}")
+    if default_font_size is not None:
+        changes.append(f"font_size={default_font_size}pt")
+    return f"Updated document style ({', '.join(changes)}) for document {document_id}. Link: {link}"
+
+
+@server.tool()
+@handle_http_errors("manage_named_range", service_type="docs")
+@require_google_service("docs", "docs_write")
+async def manage_named_range(
+    service: Any,
+    user_google_email: str,
+    document_id: str,
+    action: str,
+    name: str,
+    start_index: int = None,
+    end_index: int = None,
+    named_range_id: str = None,
+    replacement_text: str = None,
+) -> str:
+    """
+    Creates, deletes, or replaces content in named ranges in a Google Doc.
+
+    Args:
+        user_google_email: User's Google email address
+        document_id: ID of the document to update
+        action: Action to perform - "create", "delete", or "replace_content"
+        name: Name of the named range
+        start_index: Start position for creating a named range
+        end_index: End position for creating a named range
+        named_range_id: ID of the named range (for delete action)
+        replacement_text: Text to replace the named range content with (for replace_content action)
+
+    Returns:
+        str: Confirmation message with operation details
+    """
+    logger.info(
+        f"[manage_named_range] Doc={document_id}, action={action}, name={name}"
+    )
+
+    validator = ValidationManager()
+    is_valid, error_msg = validator.validate_document_id(document_id)
+    if not is_valid:
+        return f"Error: {error_msg}"
+
+    if action not in ("create", "delete", "replace_content"):
+        return "Error: action must be one of 'create', 'delete', or 'replace_content'."
+
+    requests = []
+
+    if action == "create":
+        if start_index is None or end_index is None:
+            return "Error: 'start_index' and 'end_index' are required for creating a named range."
+        requests.append({
+            "createNamedRange": {
+                "name": name,
+                "range": {"startIndex": start_index, "endIndex": end_index},
+            }
+        })
+    elif action == "delete":
+        if named_range_id:
+            requests.append({
+                "deleteNamedRange": {"namedRangeId": named_range_id}
+            })
+        else:
+            requests.append({
+                "deleteNamedRange": {"name": name}
+            })
+    elif action == "replace_content":
+        if replacement_text is None:
+            return "Error: 'replacement_text' is required for replace_content action."
+        requests.append({
+            "replaceNamedRangeContent": {
+                "namedRangeName": name,
+                "text": replacement_text,
+            }
+        })
+
+    result = await asyncio.to_thread(
+        service.documents()
+        .batchUpdate(documentId=document_id, body={"requests": requests})
+        .execute
+    )
+
+    link = f"https://docs.google.com/document/d/{document_id}/edit"
+
+    if action == "create":
+        # Extract the created named range ID from the response
+        range_id = ""
+        if "replies" in result and result["replies"]:
+            reply = result["replies"][0]
+            if "createNamedRange" in reply:
+                range_id = reply["createNamedRange"].get("namedRangeId", "")
+        return f"Created named range '{name}' (ID: {range_id}) at {start_index}-{end_index} in document {document_id}. Link: {link}"
+    elif action == "delete":
+        return f"Deleted named range '{name}' from document {document_id}. Link: {link}"
+    else:
+        return f"Replaced content of named range '{name}' with '{replacement_text[:50]}{'...' if len(replacement_text) > 50 else ''}' in document {document_id}. Link: {link}"
+
+
+@server.tool()
+@handle_http_errors("manage_table_structure", service_type="docs")
+@require_google_service("docs", "docs_write")
+async def manage_table_structure(
+    service: Any,
+    user_google_email: str,
+    document_id: str,
+    action: str,
+    table_start_index: int,
+    row_index: int = None,
+    column_index: int = None,
+    insert_below: bool = True,
+    insert_right: bool = True,
+    start_row: int = None,
+    end_row: int = None,
+    start_column: int = None,
+    end_column: int = None,
+) -> str:
+    """
+    Modifies table structure in a Google Doc - insert/delete rows/columns, merge/unmerge cells.
+
+    Args:
+        user_google_email: User's Google email address
+        document_id: ID of the document to update
+        action: Action to perform - "insert_row", "insert_column", "delete_row", "delete_column", "merge_cells", "unmerge_cells"
+        table_start_index: The start index of the table in the document
+        row_index: Row index for insert/delete row operations
+        column_index: Column index for insert/delete column operations
+        insert_below: Whether to insert row below the specified index (default: True)
+        insert_right: Whether to insert column to the right of the specified index (default: True)
+        start_row: Start row for merge/unmerge operations
+        end_row: End row for merge/unmerge operations (exclusive)
+        start_column: Start column for merge/unmerge operations
+        end_column: End column for merge/unmerge operations (exclusive)
+
+    Returns:
+        str: Confirmation message with operation details
+    """
+    logger.info(
+        f"[manage_table_structure] Doc={document_id}, action={action}, table_start={table_start_index}"
+    )
+
+    validator = ValidationManager()
+    is_valid, error_msg = validator.validate_document_id(document_id)
+    if not is_valid:
+        return f"Error: {error_msg}"
+
+    valid_actions = ("insert_row", "insert_column", "delete_row", "delete_column", "merge_cells", "unmerge_cells")
+    if action not in valid_actions:
+        return f"Error: action must be one of {', '.join(valid_actions)}."
+
+    table_location = {"tableStartLocation": {"index": table_start_index}}
+    requests = []
+
+    if action == "insert_row":
+        if row_index is None:
+            return "Error: 'row_index' is required for insert_row action."
+        requests.append({
+            "insertTableRow": {
+                **table_location,
+                "cellLocation": {
+                    "tableStartLocation": {"index": table_start_index},
+                    "rowIndex": row_index,
+                    "columnIndex": 0,
+                },
+                "insertBelow": insert_below,
+            }
+        })
+    elif action == "insert_column":
+        if column_index is None:
+            return "Error: 'column_index' is required for insert_column action."
+        requests.append({
+            "insertTableColumn": {
+                "cellLocation": {
+                    "tableStartLocation": {"index": table_start_index},
+                    "rowIndex": 0,
+                    "columnIndex": column_index,
+                },
+                "insertRight": insert_right,
+            }
+        })
+    elif action == "delete_row":
+        if row_index is None:
+            return "Error: 'row_index' is required for delete_row action."
+        requests.append({
+            "deleteTableRow": {
+                "tableCellLocation": {
+                    "tableStartLocation": {"index": table_start_index},
+                    "rowIndex": row_index,
+                    "columnIndex": 0,
+                },
+            }
+        })
+    elif action == "delete_column":
+        if column_index is None:
+            return "Error: 'column_index' is required for delete_column action."
+        requests.append({
+            "deleteTableColumn": {
+                "tableCellLocation": {
+                    "tableStartLocation": {"index": table_start_index},
+                    "rowIndex": 0,
+                    "columnIndex": column_index,
+                },
+            }
+        })
+    elif action in ("merge_cells", "unmerge_cells"):
+        if any(v is None for v in [start_row, end_row, start_column, end_column]):
+            return "Error: 'start_row', 'end_row', 'start_column', and 'end_column' are all required for merge/unmerge operations."
+        table_range = {
+            "tableCellLocation": {
+                "tableStartLocation": {"index": table_start_index},
+                "rowIndex": start_row,
+                "columnIndex": start_column,
+            },
+            "rowSpan": end_row - start_row,
+            "columnSpan": end_column - start_column,
+        }
+        if action == "merge_cells":
+            requests.append({"mergeTableCells": {"tableRange": table_range}})
+        else:
+            requests.append({"unmergeTableCells": {"tableRange": table_range}})
+
+    await asyncio.to_thread(
+        service.documents()
+        .batchUpdate(documentId=document_id, body={"requests": requests})
+        .execute
+    )
+
+    link = f"https://docs.google.com/document/d/{document_id}/edit"
+    return f"Successfully performed '{action}' on table at index {table_start_index} in document {document_id}. Link: {link}"
+
+
+@server.tool()
+@handle_http_errors("insert_section_break", service_type="docs")
+@require_google_service("docs", "docs_write")
+async def insert_section_break(
+    service: Any,
+    user_google_email: str,
+    document_id: str,
+    index: int,
+    section_type: str = "NEXT_PAGE",
+) -> str:
+    """
+    Inserts a section break into a Google Doc.
+
+    Args:
+        user_google_email: User's Google email address
+        document_id: ID of the document to update
+        index: Position to insert the section break
+        section_type: Type of section break - "CONTINUOUS" or "NEXT_PAGE" (default: "NEXT_PAGE")
+
+    Returns:
+        str: Confirmation message with operation details
+    """
+    logger.info(
+        f"[insert_section_break] Doc={document_id}, index={index}, type={section_type}"
+    )
+
+    validator = ValidationManager()
+    is_valid, error_msg = validator.validate_document_id(document_id)
+    if not is_valid:
+        return f"Error: {error_msg}"
+
+    if section_type not in ("CONTINUOUS", "NEXT_PAGE"):
+        return "Error: section_type must be 'CONTINUOUS' or 'NEXT_PAGE'."
+
+    if index == 0:
+        index = 1
+
+    request = {
+        "insertSectionBreak": {
+            "location": {"index": index},
+            "sectionType": section_type,
+        }
+    }
+
+    await asyncio.to_thread(
+        service.documents()
+        .batchUpdate(documentId=document_id, body={"requests": [request]})
+        .execute
+    )
+
+    link = f"https://docs.google.com/document/d/{document_id}/edit"
+    return f"Inserted {section_type} section break at index {index} in document {document_id}. Link: {link}"
+
+
+@server.tool()
+@handle_http_errors("insert_footnote", service_type="docs")
+@require_google_service("docs", "docs_write")
+async def insert_footnote(
+    service: Any,
+    user_google_email: str,
+    document_id: str,
+    index: int,
+    footnote_text: str = None,
+) -> str:
+    """
+    Inserts a footnote reference at the specified position in a Google Doc, optionally with text.
+
+    Args:
+        user_google_email: User's Google email address
+        document_id: ID of the document to update
+        index: Position to insert the footnote reference
+        footnote_text: Optional text to add to the footnote body
+
+    Returns:
+        str: Confirmation message with operation details
+    """
+    logger.info(
+        f"[insert_footnote] Doc={document_id}, index={index}, has_text={footnote_text is not None}"
+    )
+
+    validator = ValidationManager()
+    is_valid, error_msg = validator.validate_document_id(document_id)
+    if not is_valid:
+        return f"Error: {error_msg}"
+
+    if index == 0:
+        index = 1
+
+    # Step 1: Create the footnote
+    create_request = {
+        "createFootnote": {
+            "location": {"index": index},
+        }
+    }
+
+    result = await asyncio.to_thread(
+        service.documents()
+        .batchUpdate(documentId=document_id, body={"requests": [create_request]})
+        .execute
+    )
+
+    footnote_id = ""
+    if "replies" in result and result["replies"]:
+        reply = result["replies"][0]
+        if "createFootnote" in reply:
+            footnote_id = reply["createFootnote"].get("footnoteId", "")
+
+    # Step 2: If footnote_text is provided, insert text into the footnote body
+    if footnote_text and footnote_id:
+        # Get the document to find the footnote content element index
+        doc = await asyncio.to_thread(
+            service.documents().get(documentId=document_id).execute
+        )
+
+        footnotes = doc.get("footnotes", {})
+        footnote = footnotes.get(footnote_id, {})
+        footnote_content = footnote.get("content", [])
+
+        if footnote_content:
+            # Find the first paragraph's start index in the footnote
+            first_element = footnote_content[0]
+            if "paragraph" in first_element:
+                # Insert at the start of the footnote paragraph
+                footnote_start = first_element.get("startIndex", 0)
+                insert_request = {
+                    "insertText": {
+                        "location": {
+                            "segmentId": footnote_id,
+                            "index": footnote_start,
+                        },
+                        "text": footnote_text,
+                    }
+                }
+
+                await asyncio.to_thread(
+                    service.documents()
+                    .batchUpdate(documentId=document_id, body={"requests": [insert_request]})
+                    .execute
+                )
+
+    link = f"https://docs.google.com/document/d/{document_id}/edit"
+    text_info = f" with text '{footnote_text[:50]}{'...' if len(footnote_text) > 50 else ''}'" if footnote_text else ""
+    return f"Inserted footnote{text_info} at index {index} (footnote ID: {footnote_id}) in document {document_id}. Link: {link}"
+
+
+@server.tool()
+@handle_http_errors("delete_positioned_object", service_type="docs")
+@require_google_service("docs", "docs_write")
+async def delete_positioned_object(
+    service: Any,
+    user_google_email: str,
+    document_id: str,
+    object_id: str,
+) -> str:
+    """
+    Deletes a positioned object (such as an image) from a Google Doc.
+
+    Args:
+        user_google_email: User's Google email address
+        document_id: ID of the document to update
+        object_id: The ID of the positioned object to delete
+
+    Returns:
+        str: Confirmation message with operation details
+    """
+    logger.info(
+        f"[delete_positioned_object] Doc={document_id}, object_id={object_id}"
+    )
+
+    validator = ValidationManager()
+    is_valid, error_msg = validator.validate_document_id(document_id)
+    if not is_valid:
+        return f"Error: {error_msg}"
+
+    if not object_id:
+        return "Error: 'object_id' is required."
+
+    request = {
+        "deletePositionedObject": {
+            "objectId": object_id,
+        }
+    }
+
+    await asyncio.to_thread(
+        service.documents()
+        .batchUpdate(documentId=document_id, body={"requests": [request]})
+        .execute
+    )
+
+    link = f"https://docs.google.com/document/d/{document_id}/edit"
+    return f"Deleted positioned object '{object_id}' from document {document_id}. Link: {link}"
 
 
 # Create comment management tools for documents

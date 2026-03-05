@@ -732,6 +732,40 @@ def _build_boolean_rule(
     )
 
 
+async def _get_sheet_id_by_name(service, spreadsheet_id: str, sheet_name: str) -> int:
+    """
+    Look up a sheet's numeric sheetId by its tab name.
+
+    Args:
+        service: The authenticated Sheets API service.
+        spreadsheet_id: The spreadsheet ID.
+        sheet_name: The human-readable sheet tab name.
+
+    Returns:
+        The integer sheetId for the named sheet.
+
+    Raises:
+        UserInputError: If the sheet name is not found.
+    """
+    metadata = await asyncio.to_thread(
+        service.spreadsheets()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            fields="sheets(properties(sheetId,title))",
+        )
+        .execute
+    )
+    sheets = metadata.get("sheets", [])
+    for sheet in sheets:
+        props = sheet.get("properties", {})
+        if props.get("title") == sheet_name:
+            return props["sheetId"]
+    available = [s.get("properties", {}).get("title", "Untitled") for s in sheets]
+    raise UserInputError(
+        f"Sheet '{sheet_name}' not found. Available sheets: {', '.join(available)}."
+    )
+
+
 def _build_gradient_rule(
     ranges: List[dict],
     gradient_points: List[dict],
