@@ -8,7 +8,7 @@ import logging
 import asyncio
 import json
 import copy
-from typing import List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from auth.service_decorator import require_google_service
 from core.server import server
@@ -21,6 +21,7 @@ from gsheets.sheets_helpers import (
     _build_gradient_rule,
     _fetch_detailed_sheet_errors,
     _fetch_sheets_with_rules,
+    _format_a1_cell,
     _format_conditional_rules_section,
     _format_sheet_error_section,
     _get_sheet_id_by_name,
@@ -34,6 +35,309 @@ from gsheets.sheets_helpers import (
 
 # Configure module logger
 logger = logging.getLogger(__name__)
+
+CELL_FACETS = {
+    "value",
+    "formatted_value",
+    "format",
+    "effective_format",
+    "text_runs",
+    "hyperlinks",
+    "notes",
+    "validation",
+    "chips",
+}
+
+MUTABLE_CELL_FIELDS = [
+    "userEnteredValue",
+    "userEnteredFormat",
+    "textFormatRuns",
+    "note",
+    "dataValidation",
+]
+
+
+def _normalize_json_input(value: Any, field_name: str) -> Any:
+    """Parse a JSON-encoded MCP argument when needed."""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise UserInputError(f"Invalid JSON for '{field_name}': {exc}") from exc
+    return value
+
+
+def _normalize_facets(facets: Optional[Union[str, List[str]]]) -> List[str]:
+    parsed = _normalize_json_input(facets, "facets")
+    if parsed is None:
+        return ["value", "formatted_value", "format", "text_runs", "notes", "hyperlinks"]
+    if not isinstance(parsed, list):
+        raise UserInputError("facets must be a list of facet names.")
+
+    normalized: List[str] = []
+    for item in parsed:
+        if not isinstance(item, str):
+            raise UserInputError("Each facet must be a string.")
+        facet = item.strip().lower()
+        if facet not in CELL_FACETS:
+            raise UserInputError(
+                f"Unsupported facet '{item}'. Allowed: {sorted(CELL_FACETS)}."
+            )
+        if facet not in normalized:
+            normalized.append(facet)
+
+    if "text_runs" in normalized and "formatted_value" not in normalized:
+        normalized.append("formatted_value")
+    return normalized
+
+
+def _cell_fields_for_facets(facets: List[str]) -> str:
+    cell_fields: List[str] = []
+    if "value" in facets:
+        cell_fields.extend(["userEnteredValue", "effectiveValue"])
+    if "formatted_value" in facets:
+        cell_fields.append("formattedValue")
+    if "format" in facets:
+        cell_fields.append("userEnteredFormat")
+    if "effective_format" in facets:
+        cell_fields.append("effectiveFormat")
+    if "text_runs" in facets:
+        cell_fields.extend(["textFormatRuns", "userEnteredValue", "formattedValue"])
+    if "hyperlinks" in facets:
+        cell_fields.append("hyperlink")
+    if "notes" in facets:
+        cell_fields.append("note")
+    if "validation" in facets:
+        cell_fields.append("dataValidation")
+    if "chips" in facets:
+        cell_fields.append("chipRuns")
+
+    joined = ",".join(dict.fromkeys(cell_fields))
+    return (
+        "sheets(properties(title,sheetId),"
+        f"data(startRow,startColumn,rowData(values({joined}))))"
+    )
+
+
+def _scalar_from_extended_value(value: Optional[dict]) -> Any:
+    if not value:
+        return None
+    for key in (
+        "stringValue",
+        "numberValue",
+        "boolValue",
+        "formulaValue",
+        "errorValue",
+    ):
+        if key in value:
+            return value[key]
+    return None
+
+
+def _derive_text_segments(text: str, text_format_runs: List[dict]) -> List[dict]:
+    if not text_format_runs:
+        return []
+
+    sorted_runs = sorted(
+        [run for run in text_format_runs if isinstance(run, dict)],
+        key=lambda run: int(run.get("startIndex", 0)),
+    )
+    segments: List[dict] = []
+    for idx, run in enumerate(sorted_runs):
+        start = int(run.get("startIndex", 0))
+        end = (
+            int(sorted_runs[idx + 1].get("startIndex", len(text)))
+            if idx + 1 < len(sorted_runs)
+            else len(text)
+        )
+        segments.append(
+            {
+                "start": start,
+                "end": end,
+                "text": text[start:end],
+                "format": copy.deepcopy(run.get("format", {})),
+            }
+        )
+    return segments
+
+
+def _cell_has_payload(cell: dict) -> bool:
+    for key in (
+        "userEnteredValue",
+        "effectiveValue",
+        "formattedValue",
+        "userEnteredFormat",
+        "effectiveFormat",
+        "textFormatRuns",
+        "hyperlink",
+        "note",
+        "dataValidation",
+        "chipRuns",
+    ):
+        if key in cell and cell.get(key) not in (None, "", [], {}):
+            return True
+    return False
+
+
+def _serialize_grid_cell(
+    *,
+    cell: dict,
+    sheet_title: str,
+    row_index: int,
+    col_index: int,
+    facets: List[str],
+) -> dict:
+    result: Dict[str, Any] = {
+        "a1": _format_a1_cell(sheet_title, row_index, col_index),
+        "row": row_index + 1,
+        "column": col_index + 1,
+    }
+
+    if "value" in facets:
+        user_value = copy.deepcopy(cell.get("userEnteredValue"))
+        effective_value = copy.deepcopy(cell.get("effectiveValue"))
+        result["userEnteredValue"] = user_value
+        result["effectiveValue"] = effective_value
+        result["value"] = _scalar_from_extended_value(user_value or effective_value)
+    if "formatted_value" in facets:
+        result["formattedValue"] = cell.get("formattedValue")
+    if "format" in facets:
+        result["userEnteredFormat"] = copy.deepcopy(cell.get("userEnteredFormat"))
+    if "effective_format" in facets:
+        result["effectiveFormat"] = copy.deepcopy(cell.get("effectiveFormat"))
+    if "hyperlinks" in facets and "hyperlink" in cell:
+        result["hyperlink"] = cell.get("hyperlink")
+    if "notes" in facets and "note" in cell:
+        result["note"] = cell.get("note")
+    if "validation" in facets and "dataValidation" in cell:
+        result["dataValidation"] = copy.deepcopy(cell.get("dataValidation"))
+    if "chips" in facets and "chipRuns" in cell:
+        result["chipRuns"] = copy.deepcopy(cell.get("chipRuns"))
+    if "text_runs" in facets:
+        raw_runs = copy.deepcopy(cell.get("textFormatRuns") or [])
+        result["textFormatRuns"] = raw_runs
+        text_value = (
+            ((cell.get("userEnteredValue") or {}).get("stringValue"))
+            or cell.get("formattedValue")
+            or ""
+        )
+        result["text"] = text_value
+        result["segments"] = _derive_text_segments(text_value, raw_runs)
+
+    return result
+
+
+def _coerce_extended_value(value: Any) -> dict:
+    if isinstance(value, dict):
+        known = {
+            "stringValue",
+            "numberValue",
+            "boolValue",
+            "formulaValue",
+            "errorValue",
+        }
+        if known.intersection(value.keys()):
+            return copy.deepcopy(value)
+        raise UserInputError(
+            "Value dicts must use Sheets ExtendedValue keys like stringValue or formulaValue."
+        )
+    if isinstance(value, bool):
+        return {"boolValue": value}
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return {"numberValue": value}
+    if value is None:
+        return {}
+    return {"stringValue": str(value)}
+
+
+def _coerce_text_run(run: dict, text_length: int) -> dict:
+    if not isinstance(run, dict):
+        raise UserInputError("Each text run must be an object.")
+
+    if "startIndex" in run and "format" in run:
+        return {
+            "startIndex": int(run["startIndex"]),
+            "format": copy.deepcopy(run["format"]),
+        }
+
+    start = run.get("from", run.get("start"))
+    end = run.get("to", run.get("end"))
+    if start is None:
+        raise UserInputError("Friendly text runs require 'from' or 'start'.")
+    start_int = int(start)
+    end_int = int(end) if end is not None else text_length
+    if start_int < 0 or end_int < start_int:
+        raise UserInputError("Invalid text run bounds.")
+    format_obj = copy.deepcopy(run.get("format") or {})
+    return {"startIndex": start_int, "endIndex": end_int, "format": format_obj}
+
+
+def _normalize_text_runs_input(runs: Any, text_length: int) -> List[dict]:
+    parsed = _normalize_json_input(runs, "text_runs")
+    if parsed is None:
+        return []
+    if not isinstance(parsed, list):
+        raise UserInputError("text_runs must be a list.")
+
+    normalized = [_coerce_text_run(run, text_length) for run in parsed]
+    normalized.sort(key=lambda run: int(run.get("startIndex", 0)))
+    return [
+        {"startIndex": int(run["startIndex"]), "format": copy.deepcopy(run["format"])}
+        for run in normalized
+    ]
+
+
+def _friendly_patch_to_cell(patch: dict) -> tuple[dict, List[str]]:
+    if not isinstance(patch, dict):
+        raise UserInputError("Each cell patch must be an object.")
+
+    cell = copy.deepcopy(patch.get("cell") or {})
+    if cell and not isinstance(cell, dict):
+        raise UserInputError("'cell' must be an object when provided.")
+
+    text = patch.get("text")
+    if text is not None:
+        cell["userEnteredValue"] = {"stringValue": str(text)}
+
+    if "value" in patch:
+        cell["userEnteredValue"] = _coerce_extended_value(patch["value"])
+    if "formula" in patch:
+        cell["userEnteredValue"] = {"formulaValue": str(patch["formula"])}
+    if "note" in patch:
+        cell["note"] = patch["note"]
+    if "base_format" in patch:
+        cell["userEnteredFormat"] = copy.deepcopy(patch["base_format"])
+    if "userEnteredFormat" in patch:
+        cell["userEnteredFormat"] = copy.deepcopy(patch["userEnteredFormat"])
+    if "dataValidation" in patch:
+        cell["dataValidation"] = copy.deepcopy(patch["dataValidation"])
+
+    run_key = "text_runs" if "text_runs" in patch else "runs" if "runs" in patch else None
+    if run_key:
+        current_text = (
+            ((cell.get("userEnteredValue") or {}).get("stringValue"))
+            or str(text or "")
+        )
+        cell["textFormatRuns"] = _normalize_text_runs_input(
+            patch.get(run_key), len(current_text)
+        )
+
+    if patch.get("clear_text_runs"):
+        cell["textFormatRuns"] = []
+    if patch.get("clear_note"):
+        cell["note"] = None
+
+    fields = [field for field in MUTABLE_CELL_FIELDS if field in cell]
+    return cell, fields
+
+
+def _field_mask_for_patch(fields: List[str], mode: str) -> str:
+    if mode == "replace":
+        return ",".join(MUTABLE_CELL_FIELDS)
+    ordered = [field for field in MUTABLE_CELL_FIELDS if field in fields]
+    if not ordered:
+        raise UserInputError("Cell patch did not specify any mutable fields.")
+    return ",".join(ordered)
 
 
 @server.tool()
@@ -147,6 +451,286 @@ async def get_spreadsheet_info(
         f"Successfully retrieved info for spreadsheet {file_id} for {user_google_email}."
     )
     return text_output
+
+
+@server.tool()
+@handle_http_errors("get_sheet_cells", is_read_only=True, service_type="sheets")
+@require_google_service("sheets", "sheets_read")
+async def get_sheet_cells(
+    service,
+    file_id: str,
+    range_name: str = "A1:Z1000",
+    facets: Optional[Union[str, List[str]]] = None,
+    include_empty: bool = False,
+    user_google_email: str = "",
+) -> str:
+    """Read structured CellData for a range. facets can include value, formatted_value, format, effective_format, text_runs, hyperlinks, notes, validation, chips."""
+    selected_facets = _normalize_facets(facets)
+    logger.info(
+        "[get_sheet_cells] Invoked. Email: '%s', Spreadsheet: %s, Range: %s, Facets: %s",
+        user_google_email,
+        file_id,
+        range_name,
+        selected_facets,
+    )
+
+    response = await asyncio.to_thread(
+        service.spreadsheets()
+        .get(
+            spreadsheetId=file_id,
+            ranges=[range_name],
+            includeGridData=True,
+            fields=_cell_fields_for_facets(selected_facets),
+        )
+        .execute
+    )
+
+    payload = {
+        "spreadsheetId": file_id,
+        "requestedRange": range_name,
+        "facets": selected_facets,
+        "sheets": [],
+    }
+
+    for sheet in response.get("sheets", []) or []:
+        sheet_title = sheet.get("properties", {}).get("title") or "Unknown"
+        row_groups: List[List[dict]] = []
+        for grid in sheet.get("data", []) or []:
+            start_row = int(grid.get("startRow", 0) or 0)
+            start_col = int(grid.get("startColumn", 0) or 0)
+            for row_offset, row_data in enumerate(grid.get("rowData", []) or []):
+                current_row: List[dict] = []
+                for col_offset, cell in enumerate(row_data.get("values", []) or []):
+                    if not include_empty and not _cell_has_payload(cell):
+                        continue
+                    current_row.append(
+                        _serialize_grid_cell(
+                            cell=cell,
+                            sheet_title=sheet_title,
+                            row_index=start_row + row_offset,
+                            col_index=start_col + col_offset,
+                            facets=selected_facets,
+                        )
+                    )
+                if current_row or include_empty:
+                    row_groups.append(current_row)
+
+        payload["sheets"].append({"title": sheet_title, "rows": row_groups})
+
+    return json.dumps(payload, ensure_ascii=True, indent=2)
+
+
+@server.tool()
+@handle_http_errors("update_sheet_cells", service_type="sheets")
+@require_google_service("sheets", "sheets_write")
+async def update_sheet_cells(
+    service,
+    file_id: str,
+    cells: Union[str, List[dict]],
+    mode: Literal["patch", "replace"] = "patch",
+    user_google_email: str = "",
+) -> str:
+    """Apply CellData patches to cells. Each patch must include an A1 target and can supply raw CellData or friendly aliases like text, value, formula, note, base_format, and runs/text_runs."""
+    parsed_cells = _normalize_json_input(cells, "cells")
+    if not isinstance(parsed_cells, list) or not parsed_cells:
+        raise UserInputError("cells must be a non-empty list of cell patch objects.")
+    if mode not in {"patch", "replace"}:
+        raise UserInputError("mode must be either 'patch' or 'replace'.")
+
+    logger.info(
+        "[update_sheet_cells] Invoked. Email: '%s', Spreadsheet: %s, Mode: %s, Patches: %s",
+        user_google_email,
+        file_id,
+        mode,
+        len(parsed_cells),
+    )
+
+    metadata = await asyncio.to_thread(
+        service.spreadsheets()
+        .get(
+            spreadsheetId=file_id,
+            fields="sheets(properties(sheetId,title))",
+        )
+        .execute
+    )
+    sheets = metadata.get("sheets", []) or []
+
+    requests = []
+    touched_cells: List[str] = []
+    for patch in parsed_cells:
+        if not isinstance(patch, dict):
+            raise UserInputError("Each item in cells must be an object.")
+
+        a1 = patch.get("a1") or patch.get("range_name")
+        if not isinstance(a1, str) or not a1.strip():
+            raise UserInputError("Each cell patch must include a non-empty 'a1'.")
+
+        grid_range = _parse_a1_range(a1, sheets)
+        start_row = grid_range.get("startRowIndex")
+        start_col = grid_range.get("startColumnIndex")
+        end_row = grid_range.get("endRowIndex")
+        end_col = grid_range.get("endColumnIndex")
+        if None in (start_row, start_col, end_row, end_col):
+            raise UserInputError(
+                f"Patch target '{a1}' must resolve to a single cell, not an open-ended range."
+            )
+        if (end_row - start_row) != 1 or (end_col - start_col) != 1:
+            raise UserInputError(
+                f"Patch target '{a1}' must reference exactly one cell."
+            )
+
+        cell_payload, patch_fields = _friendly_patch_to_cell(patch)
+        field_mask = _field_mask_for_patch(patch_fields, mode)
+        requests.append(
+            {
+                "updateCells": {
+                    "range": grid_range,
+                    "rows": [{"values": [cell_payload]}],
+                    "fields": field_mask,
+                }
+            }
+        )
+        touched_cells.append(a1)
+
+    await asyncio.to_thread(
+        service.spreadsheets()
+        .batchUpdate(spreadsheetId=file_id, body={"requests": requests})
+        .execute
+    )
+
+    return (
+        f"Updated {len(touched_cells)} cell(s) in patch mode '{mode}': "
+        + ", ".join(touched_cells)
+    )
+
+
+@server.tool()
+@handle_http_errors("transform_sheet_cells", service_type="sheets")
+@require_google_service("sheets", "sheets_write")
+async def transform_sheet_cells(
+    service,
+    file_id: str,
+    range_name: str,
+    operations: Union[str, List[dict]],
+    user_google_email: str = "",
+) -> str:
+    """Read a range, apply declarative text/note transformations, and write affected cells back. Supported operations: replace_text, set_text, clear_runs, apply_run_format, set_note, clear_note."""
+    parsed_ops = _normalize_json_input(operations, "operations")
+    if not isinstance(parsed_ops, list) or not parsed_ops:
+        raise UserInputError(
+            "operations must be a non-empty list of transformation objects."
+        )
+
+    raw_cells_json = await get_sheet_cells(
+        service=service,
+        file_id=file_id,
+        range_name=range_name,
+        facets=["value", "formatted_value", "format", "text_runs", "notes"],
+        include_empty=False,
+        user_google_email=user_google_email,
+    )
+    snapshot = json.loads(raw_cells_json)
+
+    patches: List[dict] = []
+    for sheet in snapshot.get("sheets", []):
+        for row in sheet.get("rows", []):
+            for cell in row:
+                working = {
+                    "a1": cell["a1"],
+                    "text": cell.get("text")
+                    if isinstance(cell.get("text"), str)
+                    else (
+                        cell.get("value")
+                        if isinstance(cell.get("value"), str)
+                        else None
+                    ),
+                    "base_format": copy.deepcopy(cell.get("userEnteredFormat") or {}),
+                    "runs": copy.deepcopy(cell.get("textFormatRuns") or []),
+                    "note": cell.get("note"),
+                }
+                changed = False
+
+                for operation in parsed_ops:
+                    if not isinstance(operation, dict):
+                        raise UserInputError("Each operation must be an object.")
+                    op_type = operation.get("type")
+                    if op_type == "set_text":
+                        working["text"] = str(operation.get("text", ""))
+                        changed = True
+                    elif op_type == "replace_text":
+                        target = operation.get("find")
+                        if not isinstance(target, str) or target == "":
+                            raise UserInputError(
+                                "replace_text requires a non-empty 'find' string."
+                            )
+                        replacement = str(operation.get("replace", ""))
+                        text_value = working.get("text")
+                        if isinstance(text_value, str) and target in text_value:
+                            working["text"] = text_value.replace(target, replacement)
+                            changed = True
+                    elif op_type == "clear_runs":
+                        if working.get("runs"):
+                            working["runs"] = []
+                            changed = True
+                    elif op_type == "apply_run_format":
+                        match_text = operation.get("match")
+                        fmt = operation.get("format")
+                        text_value = working.get("text")
+                        if not isinstance(fmt, dict):
+                            raise UserInputError(
+                                "apply_run_format requires a format object."
+                            )
+                        if (
+                            isinstance(match_text, str)
+                            and match_text
+                            and isinstance(text_value, str)
+                            and text_value
+                        ):
+                            start = text_value.find(match_text)
+                            if start >= 0:
+                                runs = working.get("runs") or []
+                                runs.append(
+                                    {
+                                        "startIndex": start,
+                                        "format": copy.deepcopy(fmt),
+                                    }
+                                )
+                                working["runs"] = sorted(
+                                    runs,
+                                    key=lambda run: int(run.get("startIndex", 0)),
+                                )
+                                changed = True
+                    elif op_type == "set_note":
+                        working["note"] = str(operation.get("note", ""))
+                        changed = True
+                    elif op_type == "clear_note":
+                        if working.get("note") is not None:
+                            working["note"] = None
+                            changed = True
+                    else:
+                        raise UserInputError(
+                            f"Unsupported transform operation '{op_type}'."
+                        )
+
+                if changed:
+                    patch: Dict[str, Any] = {"a1": working["a1"]}
+                    if working.get("text") is not None:
+                        patch["text"] = working["text"]
+                    patch["base_format"] = working["base_format"]
+                    patch["runs"] = working.get("runs") or []
+                    patch["note"] = working.get("note")
+                    patches.append(patch)
+
+    if not patches:
+        return f"No cells changed in {range_name}."
+
+    return await update_sheet_cells(
+        service=service,
+        file_id=file_id,
+        cells=patches,
+        mode="patch",
+        user_google_email=user_google_email,
+    )
 
 
 @server.tool()

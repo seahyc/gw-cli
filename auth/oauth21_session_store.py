@@ -7,7 +7,9 @@ session context management and credential conversion functionality.
 """
 
 import contextvars
+import json
 import logging
+import os
 from typing import Dict, Optional, Any, Tuple
 from threading import RLock
 from datetime import datetime, timedelta, timezone
@@ -49,6 +51,22 @@ def _normalize_expiry_to_naive_utc(expiry: Optional[Any]) -> Optional[datetime]:
         return _normalize_expiry_to_naive_utc(parsed)
 
     logger.debug("Unsupported expiry type '%s' (%s)", expiry, type(expiry))
+    return None
+
+
+def _parse_datetime_preserving_timezone(value: Optional[Any]) -> Optional[datetime]:
+    """Parse persisted timestamps while preserving timezone awareness for OAuth state TTL checks."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            logger.debug("Failed to parse datetime string '%s'", value)
+            return None
+    logger.debug("Unsupported datetime value '%s' (%s)", value, type(value))
     return None
 
 
@@ -199,9 +217,69 @@ class OAuth21SessionStore:
         ] = {}  # Maps session ID -> authenticated user email (immutable)
         self._oauth_states: Dict[str, Dict[str, Any]] = {}
         self._lock = RLock()
+        self._oauth_state_store_path = self._get_oauth_state_store_path()
+
+    @staticmethod
+    def _get_oauth_state_store_path() -> str:
+        """Get the shared on-disk path used to persist OAuth state across processes."""
+        custom_path = os.getenv("GOOGLE_MCP_OAUTH_STATE_FILE")
+        if custom_path:
+            return custom_path
+
+        home_dir = os.path.expanduser("~")
+        if home_dir and home_dir != "~":
+            return os.path.join(home_dir, ".google_workspace_mcp", "oauth_states.json")
+
+        return os.path.join(os.getcwd(), ".oauth_states.json")
+
+    def _load_oauth_states_locked(self) -> None:
+        """Reload persisted OAuth states so callbacks can be validated across processes."""
+        if not os.path.exists(self._oauth_state_store_path):
+            self._oauth_states = {}
+            return
+
+        try:
+            with open(self._oauth_state_store_path, "r", encoding="utf-8") as f:
+                raw_states = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Failed to load OAuth state store: %s", exc)
+            self._oauth_states = {}
+            return
+
+        loaded_states: Dict[str, Dict[str, Any]] = {}
+        for state, data in raw_states.items():
+            expires_at = data.get("expires_at")
+            created_at = data.get("created_at")
+            loaded_states[state] = {
+                "session_id": data.get("session_id"),
+                "expires_at": _parse_datetime_preserving_timezone(expires_at),
+                "created_at": _parse_datetime_preserving_timezone(created_at),
+            }
+
+        self._oauth_states = loaded_states
+
+    def _save_oauth_states_locked(self) -> None:
+        """Persist OAuth state so whichever process receives the callback can validate it."""
+        state_dir = os.path.dirname(self._oauth_state_store_path)
+        if state_dir:
+            os.makedirs(state_dir, exist_ok=True)
+
+        serialized = {}
+        for state, data in self._oauth_states.items():
+            expires_at = data.get("expires_at")
+            created_at = data.get("created_at")
+            serialized[state] = {
+                "session_id": data.get("session_id"),
+                "expires_at": expires_at.isoformat() if expires_at else None,
+                "created_at": created_at.isoformat() if created_at else None,
+            }
+
+        with open(self._oauth_state_store_path, "w", encoding="utf-8") as f:
+            json.dump(serialized, f)
 
     def _cleanup_expired_oauth_states_locked(self):
         """Remove expired OAuth state entries. Caller must hold lock."""
+        self._load_oauth_states_locked()
         now = datetime.now(timezone.utc)
         expired_states = [
             state
@@ -214,6 +292,8 @@ class OAuth21SessionStore:
                 "Removed expired OAuth state: %s",
                 state[:8] if len(state) > 8 else state,
             )
+        if expired_states:
+            self._save_oauth_states_locked()
 
     def store_oauth_state(
         self,
@@ -241,6 +321,7 @@ class OAuth21SessionStore:
                 state[:8] if len(state) > 8 else state,
                 expiry.isoformat(),
             )
+            self._save_oauth_states_locked()
 
     def validate_and_consume_oauth_state(
         self,
@@ -286,6 +367,7 @@ class OAuth21SessionStore:
 
             # State is valid – consume it to prevent reuse
             del self._oauth_states[state]
+            self._save_oauth_states_locked()
             logger.debug(
                 "Validated OAuth state %s",
                 state[:8] if len(state) > 8 else state,

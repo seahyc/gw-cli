@@ -11,6 +11,7 @@ Enables Claude Code to interact with your Google Workspace:
 - **Google Drive**: Read/create files (cannot share externally)
 - **Google Docs**: Read and edit documents
 - **Google Sheets**: Read and write spreadsheets
+- **Google Sheets rich cells**: Inspect and update structured CellData, including inline text format runs within a single cell
 - **Google Calendar**: View and create events (cannot add attendees)
 - **Google Forms**: Read and create forms
 - **Google Slides**: Read and edit presentations
@@ -113,6 +114,8 @@ Create a draft email to john@example.com about the meeting tomorrow
 Show me what's on my calendar for next Monday
 
 Update cell A1 in my "Budget 2025" spreadsheet to "Updated"
+
+Read rich text runs from cells B2:B8 in my spreadsheet and preserve their note formatting
 ```
 
 ## Troubleshooting

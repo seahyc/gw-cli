@@ -100,9 +100,12 @@ docs:
 sheets:
   core:
     - create_spreadsheet
+    - get_sheet_cells
+    - update_sheet_cells
+  extended:
+    - transform_sheet_cells
     - read_sheet_values
     - modify_sheet_values
-  extended:
     - list_spreadsheets
     - get_spreadsheet_info
     - format_sheet_range

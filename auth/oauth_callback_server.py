@@ -10,6 +10,8 @@ import logging
 import threading
 import time
 import socket
+import urllib.error
+import urllib.request
 import uvicorn
 
 from fastapi import FastAPI, Request
@@ -27,6 +29,24 @@ from auth.google_auth import handle_auth_callback, check_client_secrets
 from auth.oauth_config import get_oauth_redirect_uri
 
 logger = logging.getLogger(__name__)
+
+
+def _probe_existing_oauth_server(hostname: str, port: int) -> bool:
+    """
+    Check whether another compatible OAuth callback server is already listening.
+
+    Multiple MCP processes can share the same fixed localhost callback port. In that
+    case we should reuse the existing listener instead of failing the auth flow.
+    """
+    callback_url = f"http://{hostname}:{port}/oauth2callback"
+    try:
+        with urllib.request.urlopen(callback_url, timeout=1.0) as response:
+            return response.status < 500
+    except urllib.error.HTTPError as exc:
+        # Our callback route returns 4xx when called without code/state, which is fine.
+        return 400 <= exc.code < 500
+    except Exception:
+        return False
 
 
 class MinimalOAuthServer:
@@ -155,6 +175,15 @@ class MinimalOAuthServer:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.bind((hostname, self.port))
         except OSError:
+            if _probe_existing_oauth_server(hostname, self.port):
+                self.is_running = True
+                logger.info(
+                    "Reusing existing OAuth callback server on %s:%s",
+                    hostname,
+                    self.port,
+                )
+                return True, ""
+
             error_msg = f"Port {self.port} is already in use on {hostname}. Cannot start minimal OAuth server."
             logger.error(error_msg)
             return False, error_msg

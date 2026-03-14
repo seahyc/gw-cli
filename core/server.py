@@ -536,6 +536,20 @@ async def start_google_auth(
         return f"**Authentication Error:** {error_message}"
 
     try:
+        from auth.oauth_callback_server import ensure_oauth_callback_available
+        from auth.oauth_config import get_oauth_config
+
+        config = get_oauth_config()
+        success, error_msg = ensure_oauth_callback_available(
+            get_transport_mode(), config.port, config.base_uri
+        )
+        if not success:
+            error_detail = f" ({error_msg})" if error_msg else ""
+            return (
+                "**Authentication Error:** Cannot initiate OAuth flow - "
+                f"callback server unavailable{error_detail}"
+            )
+
         auth_message = await start_auth_flow(
             user_google_email=user_google_email,
             service_name=service_name,
