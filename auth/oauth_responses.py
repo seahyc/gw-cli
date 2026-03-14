@@ -9,6 +9,49 @@ from fastapi.responses import HTMLResponse
 from typing import Optional
 
 
+def _close_page_script() -> str:
+    """Return shared JS for the OAuth callback pages."""
+    return """
+        <script>
+            function tryCloseWindow() {
+                try {
+                    window.open('', '_self');
+                } catch (e) {
+                    // Ignore and continue with other close attempts.
+                }
+
+                try {
+                    window.close();
+                } catch (e) {
+                    // Ignore and fall back to the manual close state.
+                }
+
+                window.location.replace('about:blank');
+            }
+
+            document.addEventListener('DOMContentLoaded', function() {
+                var countdownElement = document.getElementById('countdown-seconds');
+                var remainingSeconds = 10;
+
+                if (countdownElement) {
+                    countdownElement.textContent = String(remainingSeconds);
+                }
+
+                var intervalId = window.setInterval(function() {
+                    remainingSeconds -= 1;
+                    if (countdownElement && remainingSeconds >= 0) {
+                        countdownElement.textContent = String(remainingSeconds);
+                    }
+                    if (remainingSeconds <= 0) {
+                        window.clearInterval(intervalId);
+                        tryCloseWindow();
+                    }
+                }, 1000);
+            });
+        </script>
+    """
+
+
 def create_error_response(error_message: str, status_code: int = 400) -> HTMLResponse:
     """
     Create a standardized error response for OAuth failures.
@@ -22,12 +65,16 @@ def create_error_response(error_message: str, status_code: int = 400) -> HTMLRes
     """
     content = f"""
         <html>
-        <head><title>Authentication Error</title></head>
+        <head>
+            <title>Authentication Error</title>
+            {_close_page_script()}
+        </head>
         <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; text-align: center;">
             <h2 style="color: #d32f2f;">Authentication Error</h2>
             <p>{error_message}</p>
             <p>Please ensure you grant the requested permissions. You can close this window and try again.</p>
-            <script>setTimeout(function() {{ window.close(); }}, 10000);</script>
+            <p>This window will close automatically in <span id="countdown-seconds">10</span> seconds.</p>
+            <button onclick="tryCloseWindow()">Close Window</button>
         </body>
         </html>
     """
@@ -175,11 +222,7 @@ def create_success_response(verified_user_id: Optional[str] = None) -> HTMLRespo
             opacity: 0.8;
         }}
     </style>
-    <script>
-        setTimeout(function() {{
-            window.close();
-        }}, 10000);
-    </script>
+    {_close_page_script()}
 </head>
 <body>
     <div class="container">
@@ -191,8 +234,8 @@ def create_success_response(verified_user_id: Optional[str] = None) -> HTMLRespo
         <div class="message">
             Your credentials have been securely saved. You can now close this window and retry your original command.
         </div>
-        <button class="button" onclick="window.close()">Close Window</button>
-        <div class="auto-close">This window will close automatically in 10 seconds</div>
+        <button class="button" onclick="tryCloseWindow()">Close Window</button>
+        <div class="auto-close">This window will close automatically in <span id="countdown-seconds">10</span> seconds</div>
     </div>
 </body>
 </html>"""
@@ -211,12 +254,16 @@ def create_server_error_response(error_detail: str) -> HTMLResponse:
     """
     content = f"""
         <html>
-        <head><title>Authentication Processing Error</title></head>
+        <head>
+            <title>Authentication Processing Error</title>
+            {_close_page_script()}
+        </head>
         <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; text-align: center;">
             <h2 style="color: #d32f2f;">Authentication Processing Error</h2>
             <p>An unexpected error occurred while processing your authentication: {error_detail}</p>
             <p>Please try again. You can close this window.</p>
-            <script>setTimeout(function() {{ window.close(); }}, 10000);</script>
+            <p>This window will close automatically in <span id="countdown-seconds">10</span> seconds.</p>
+            <button onclick="tryCloseWindow()">Close Window</button>
         </body>
         </html>
     """
