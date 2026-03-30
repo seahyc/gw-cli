@@ -120,6 +120,7 @@ def register(subparsers):
     # --- get-draft ---
     p = gmail_sub.add_parser("get-draft", help="Get full content of a draft")
     p.add_argument("draft_id", help="Draft ID")
+    p.add_argument("--html", action="store_true", help="Return raw HTML body instead of plain text")
     p.set_defaults(func=cmd_get_draft)
 
     # --- update-draft ---
@@ -332,7 +333,7 @@ def cmd_list_drafts(args):
 def cmd_get_draft(args):
     try:
         service = get_service("gmail")
-        result = gmail.get_draft(service, args.draft_id)
+        result = gmail.get_draft(service, args.draft_id, html=args.html)
         success(result)
     except Exception as e:
         error(str(e))

@@ -1337,7 +1337,7 @@ def list_drafts(service, max_results: int = 25) -> str:
     return "\n".join(output)
 
 
-def get_draft(service, draft_id: str) -> str:
+def get_draft(service, draft_id: str, html: bool = False) -> str:
     """
     Get the full content of a draft.
 
@@ -1376,7 +1376,10 @@ def get_draft(service, draft_id: str) -> str:
         output.append(f"{key}: {val}")
     output.append("")
 
-    body_text = bodies.get("text/plain") or bodies.get("text/html", "(empty body)")
+    if html:
+        body_text = bodies.get("html") or bodies.get("text", "(empty body)")
+    else:
+        body_text = _format_body_content(bodies.get("text", ""), bodies.get("html", "")) or "(empty body)"
     output.append(f"Body:\n{body_text}")
 
     if attachments:
