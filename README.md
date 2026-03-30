@@ -1,166 +1,86 @@
-# Hardened Google Workspace MCP
+# gw — Google Workspace CLI
 
-A **security-hardened** Google Workspace integration for Claude Code.
+A command-line tool for interacting with Google Workspace: Gmail, Drive, Docs, Sheets, Calendar, Forms, Slides.
 
-> This is a fork of [taylorwilsdon/google_workspace_mcp](https://github.com/taylorwilsdon/google_workspace_mcp) with dangerous operations removed to prevent data exfiltration via prompt injection attacks. See [SECURITY.md](./SECURITY.md) for details.
+Originally forked from [taylorwilsdon/google_workspace_mcp](https://github.com/taylorwilsdon/google_workspace_mcp), rebuilt as a pure CLI.
 
-## What This Does
+## Install
 
-Enables Claude Code to interact with your Google Workspace:
-- **Gmail**: Read emails, create drafts (cannot send)
-- **Google Drive**: Read/create files (cannot share externally)
-- **Google Docs**: Read and edit documents
-- **Google Sheets**: Read and write spreadsheets
-- **Google Sheets rich cells**: Inspect and update structured CellData, including inline text format runs within a single cell
-- **Google Calendar**: View and create events (cannot add attendees)
-- **Google Forms**: Read and create forms
-- **Google Slides**: Read and edit presentations
-
-## Why "Hardened"?
-
-LLMs are vulnerable to prompt injection attacks—malicious instructions hidden in content the model processes. An attacker could embed instructions in an email or document that trick the AI into exfiltrating sensitive data.
-
-This fork removes all tools that could send data outside your account:
-- **No email sending** - Claude can draft emails, but you must manually send them from Gmail
-- **No file sharing** - Claude cannot share files with external users
-- **No filter creation** - Claude cannot create auto-forwarding rules
-- **No event attendees** - Claude cannot add attendees to calendar events (invitations could exfiltrate data)
-- **Secure credential storage** - OAuth tokens stored in macOS Keychain, not plaintext files
-
-### ⚠️ This Reduces Risk, It Does NOT Eliminate It
-
-**Important:** This hardening **only** affects the Google Workspace tools. Claude Code has access to many other tools that could be used for data exfiltration (web requests, file writes, code execution, other MCP servers).
-
-**You must stay vigilant:**
-- Always review tool calls before approving them
-- Never disable permission prompts
-- Be suspicious of unexpected web requests or file operations
-- Monitor Claude's behavior when processing external content
-
-See [SECURITY.md](./SECURITY.md) for the complete security model and additional risks.
-
-## Prerequisites
-
-- Claude Code installed on your machine
-- A Google Workspace or personal Google account
-- Python 3.11+ installed
-
-## Quick Start
-
-### Step 1: Create OAuth Credentials
-
-Follow **[OAUTH_SETUP.md](./OAUTH_SETUP.md)** to create Google Cloud OAuth credentials.
-
-### Step 2: Install Dependencies
+Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-cd ~/hardened-google-workspace-mcp  # or wherever you placed it
-uv sync
+# Clone and create a shell wrapper
+git clone https://github.com/seahyc/gw-cli.git ~/Code/gw-cli
+
+# Create the wrapper script
+mkdir -p ~/.local/bin
+cat > ~/.local/bin/gw << 'EOF'
+#!/bin/bash
+exec uv run --directory ~/Code/gw-cli python -m gw "$@"
+EOF
+chmod +x ~/.local/bin/gw
 ```
 
-> **Note:** If you don't have `uv` installed, run: `curl -LsSf https://astral.sh/uv/install.sh | sh`
+Ensure `~/.local/bin` is in your `PATH`.
 
-### Step 3: Configure Claude Code
+## Setup
 
-Add the MCP server using `claude mcp add`:
+Set your Google OAuth credentials:
 
 ```bash
-claude mcp add hardened-workspace \
-  --scope user \
-  -e GOOGLE_OAUTH_CLIENT_ID="YOUR_CLIENT_ID" \
-  -e GOOGLE_OAUTH_CLIENT_SECRET="YOUR_CLIENT_SECRET" \
-  -- uv run --directory ~/hardened-google-workspace-mcp python -m main --single-user
+export GOOGLE_OAUTH_CLIENT_ID="your-client-id"
+export GOOGLE_OAUTH_CLIENT_SECRET="your-client-secret"
 ```
 
-Replace `YOUR_CLIENT_ID` and `YOUR_CLIENT_SECRET` with your OAuth credentials.
+Then authenticate:
 
-**Or manually** add to `~/.claude/mcp_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "hardened-workspace": {
-      "command": "uv",
-      "args": ["run", "--directory", "/Users/YOUR_USERNAME/hardened-google-workspace-mcp", "python", "-m", "main", "--single-user"],
-      "env": {
-        "GOOGLE_OAUTH_CLIENT_ID": "YOUR_CLIENT_ID",
-        "GOOGLE_OAUTH_CLIENT_SECRET": "YOUR_CLIENT_SECRET"
-      }
-    }
-  }
-}
+```bash
+gw auth login
 ```
 
-### Step 4: Authorize with Google
+This opens a browser for Google OAuth consent and stores credentials in macOS Keychain.
 
-1. Start (or restart) Claude Code
-2. The first time you use a Google Workspace tool, a browser window will open
-3. Sign in with your Google account
-4. Click "Allow" to grant permissions
+## Usage
 
-For detailed instructions, see **[SETUP.md](./SETUP.md)**.
-
-## Example Prompts
-
-Once set up, try these prompts in Claude Code:
-
-```
-List my recent emails from the past week
-
-Read the document "Q4 Planning" from my Google Drive
-
-Create a draft email to john@example.com about the meeting tomorrow
-
-Show me what's on my calendar for next Monday
-
-Update cell A1 in my "Budget 2025" spreadsheet to "Updated"
-
-Read rich text runs from cells B2:B8 in my spreadsheet and preserve their note formatting
+```bash
+gw <service> <action> [args]
 ```
 
-## Troubleshooting
+All output is JSON.
 
-### "OAuth credentials not found"
-Make sure you've set the `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` environment variables in your MCP config.
+### Services
 
-### "Permission denied" errors
-1. Delete the credentials folder: `rm -rf ~/.credentials/workspace-mcp/`
-2. Restart Claude Code
-3. Re-authorize with your Google account
+| Service | Description |
+|---------|-------------|
+| `gmail` | Search, read, draft, send emails |
+| `drive` | Search, read, upload, share files |
+| `docs` | Read, edit, insert content in documents |
+| `sheets` | Read, write, format spreadsheets |
+| `calendar` | List, create, modify events |
+| `forms` | Create forms, read responses |
+| `slides` | Create, read, batch-update presentations |
+| `comments` | Comments on Docs/Sheets/Slides |
+| `auth` | Login, logout, status |
 
-### "Tool not found" errors
-Make sure the MCP server is running. Check Claude Code's MCP status panel.
+### Examples
 
-### Browser doesn't open for authorization
-If the browser doesn't open automatically, check the Claude Code output for a URL to copy/paste manually.
+```bash
+# Search Gmail
+gw gmail search "from:boss subject:review"
 
-## Security Notes
+# Read a Google Sheet
+gw sheets read SPREADSHEET_ID --range "'Sheet 1'!A1:D10"
 
-- **Never disable permission prompts** - Always review what Claude is asking to do
-- **Drafts require manual sending** - Claude can create email drafts, but you must open Gmail to send them
-- **No external sharing** - Claude cannot share files outside your organization
-- **Report issues** - If Claude behaves unexpectedly, file an issue
+# Upload a file to Drive
+gw drive upload ./report.pdf --name "Q1 Report"
 
-### ⚠️ Remaining Risks
+# Create a calendar event
+gw calendar create-event --summary "Team sync" --start 2026-04-01T10:00:00 --end 2026-04-01T11:00:00
 
-While this fork removes obvious exfiltration vectors, **data leakage is still possible**:
+# Get help for any command
+gw gmail send --help
+```
 
-1. **Shared folder creation** - Creating documents in folders already shared with external parties
-2. **Attacker-owned documents** - Editing documents that an attacker has shared with you
-3. **Jailbreak with API access** - A jailbroken Claude could potentially write code to directly call Google APIs
+## License
 
-**Best practices:**
-- Review document creation/editing operations carefully
-- Be suspicious of recently shared external documents
-- Monitor your Google Drive activity after Claude sessions
-- Consider using a dedicated Google account for sensitive work
-
-See [SECURITY.md](./SECURITY.md) for comprehensive security documentation and mitigation strategies.
-
-## Support
-
-For issues with this project, please [file an issue](https://github.com/c0webster/hardened-google-workspace-mcp/issues) on GitHub.
-
----
-
-*Based on [google_workspace_mcp](https://github.com/taylorwilsdon/google_workspace_mcp) by Taylor Wilsdon, licensed under MIT.*
+MIT
