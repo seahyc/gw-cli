@@ -112,6 +112,38 @@ def register(subparsers):
     p.add_argument("filter_id", help="Filter ID to delete")
     p.set_defaults(func=cmd_delete_filter)
 
+    # --- list-drafts ---
+    p = gmail_sub.add_parser("list-drafts", help="List Gmail drafts")
+    p.add_argument("--max-results", type=int, default=25, help="Max results")
+    p.set_defaults(func=cmd_list_drafts)
+
+    # --- get-draft ---
+    p = gmail_sub.add_parser("get-draft", help="Get full content of a draft")
+    p.add_argument("draft_id", help="Draft ID")
+    p.set_defaults(func=cmd_get_draft)
+
+    # --- update-draft ---
+    p = gmail_sub.add_parser("update-draft", help="Update an existing draft")
+    p.add_argument("draft_id", help="Draft ID to update")
+    p.add_argument("--to", default=None, help="New recipient")
+    p.add_argument("--subject", default=None, help="New subject")
+    p.add_argument("--body", default=None, help="New body")
+    p.add_argument("--cc", default=None, help="New CC")
+    p.add_argument("--bcc", default=None, help="New BCC")
+    p.add_argument("--html", action="store_true", help="Body is HTML")
+    p.add_argument("--attach", action="append", dest="attachments", help="File path to attach (repeatable)")
+    p.set_defaults(func=cmd_update_draft)
+
+    # --- delete-draft ---
+    p = gmail_sub.add_parser("delete-draft", help="Delete a draft")
+    p.add_argument("draft_id", help="Draft ID to delete")
+    p.set_defaults(func=cmd_delete_draft)
+
+    # --- send-draft ---
+    p = gmail_sub.add_parser("send-draft", help="Send an existing draft")
+    p.add_argument("draft_id", help="Draft ID to send")
+    p.set_defaults(func=cmd_send_draft)
+
 
 # ---------------------------------------------------------------------------
 # Command handlers
@@ -283,6 +315,61 @@ def cmd_delete_filter(args):
     try:
         service = get_service("gmail")
         result = gmail.delete_filter(service, args.filter_id)
+        success(result)
+    except Exception as e:
+        error(str(e))
+
+
+def cmd_list_drafts(args):
+    try:
+        service = get_service("gmail")
+        result = gmail.list_drafts(service, max_results=args.max_results)
+        success(result)
+    except Exception as e:
+        error(str(e))
+
+
+def cmd_get_draft(args):
+    try:
+        service = get_service("gmail")
+        result = gmail.get_draft(service, args.draft_id)
+        success(result)
+    except Exception as e:
+        error(str(e))
+
+
+def cmd_update_draft(args):
+    try:
+        service = get_service("gmail")
+        result = gmail.update_draft(
+            service,
+            draft_id=args.draft_id,
+            subject=args.subject,
+            body=args.body,
+            to=args.to,
+            cc=args.cc,
+            bcc=args.bcc,
+            body_format="html" if args.html else "plain",
+            attachment_paths=args.attachments,
+        )
+        success(result)
+    except Exception as e:
+        error(str(e))
+
+
+def cmd_delete_draft(args):
+    try:
+        service = get_service("gmail")
+        result = gmail.delete_draft(service, args.draft_id)
+        success(result)
+    except Exception as e:
+        error(str(e))
+
+
+def cmd_send_draft(args):
+    try:
+        service = get_service("gmail")
+        result = gmail.send_draft(service, args.draft_id)
         success(result)
     except Exception as e:
         error(str(e))

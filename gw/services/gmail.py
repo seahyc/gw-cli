@@ -1278,3 +1278,244 @@ def delete_filter(service, filter_id: str) -> str:
     )
 
     return f"Filter '{filter_id}' deleted successfully!"
+
+
+def list_drafts(service, max_results: int = 25) -> str:
+    """
+    List drafts in the user's Gmail account.
+
+    Args:
+        service: Authenticated Gmail API service.
+        max_results: Maximum number of drafts to return.
+
+    Returns:
+        Formatted list of drafts with IDs, subjects, and recipients.
+    """
+    logger.info(f"[list_drafts] max_results={max_results}")
+
+    response = (
+        service.users()
+        .drafts()
+        .list(userId="me", maxResults=max_results)
+        .execute()
+    )
+
+    drafts = response.get("drafts", [])
+    if not drafts:
+        return "No drafts found."
+
+    output = [f"Found {len(drafts)} drafts:\n"]
+
+    for draft in drafts:
+        draft_id = draft.get("id", "")
+        message = draft.get("message", {})
+        message_id = message.get("id", "")
+
+        # Fetch draft details for subject/to
+        detail = (
+            service.users()
+            .drafts()
+            .get(userId="me", id=draft_id, format="metadata")
+            .execute()
+        )
+        msg = detail.get("message", {})
+        payload = msg.get("payload", {})
+        headers = _extract_headers(payload, ["Subject", "To", "Date"])
+
+        subject = headers.get("Subject", "(no subject)")
+        to = headers.get("To", "(no recipient)")
+        date = headers.get("Date", "")
+
+        output.append(f"  Draft ID: {draft_id}")
+        output.append(f"  Message ID: {message_id}")
+        output.append(f"  Subject: {subject}")
+        output.append(f"  To: {to}")
+        if date:
+            output.append(f"  Date: {date}")
+        output.append("")
+
+    return "\n".join(output)
+
+
+def get_draft(service, draft_id: str) -> str:
+    """
+    Get the full content of a draft.
+
+    Args:
+        service: Authenticated Gmail API service.
+        draft_id: The ID of the draft.
+
+    Returns:
+        Formatted draft content with headers, body, and attachment info.
+    """
+    logger.info(f"[get_draft] Draft ID: '{draft_id}'")
+
+    draft = (
+        service.users()
+        .drafts()
+        .get(userId="me", id=draft_id, format="full")
+        .execute()
+    )
+
+    msg = draft.get("message", {})
+    payload = msg.get("payload", {})
+    headers = _extract_headers(
+        payload, ["Subject", "To", "From", "Cc", "Bcc", "Date", "In-Reply-To"]
+    )
+    thread_id = msg.get("threadId", "")
+
+    bodies = _extract_message_bodies(payload)
+    attachments = _extract_attachments(payload)
+
+    output = [
+        f"Draft ID: {draft_id}",
+        f"Message ID: {msg.get('id', '')}",
+        f"Thread ID: {thread_id}",
+    ]
+    for key, val in headers.items():
+        output.append(f"{key}: {val}")
+    output.append("")
+
+    body_text = bodies.get("text/plain") or bodies.get("text/html", "(empty body)")
+    output.append(f"Body:\n{body_text}")
+
+    if attachments:
+        output.append(f"\nAttachments ({len(attachments)}):")
+        for att in attachments:
+            output.append(
+                f"  - {att.get('filename', 'unnamed')} "
+                f"({att.get('mimeType', 'unknown')}, {att.get('size', 0)} bytes)"
+            )
+
+    return "\n".join(output)
+
+
+def update_draft(
+    service,
+    draft_id: str,
+    subject: Optional[str] = None,
+    body: Optional[str] = None,
+    to: Optional[str] = None,
+    cc: Optional[str] = None,
+    bcc: Optional[str] = None,
+    body_format: Literal["plain", "html"] = "plain",
+    attachment_paths: Optional[list[str]] = None,
+) -> str:
+    """
+    Update an existing draft. Replaces the draft message entirely.
+
+    If subject/body/to are not provided, they are preserved from the
+    existing draft. New attachment_paths replace all existing attachments.
+
+    Args:
+        service: Authenticated Gmail API service.
+        draft_id: The ID of the draft to update.
+        subject: New subject (or None to keep existing).
+        body: New body content (or None to keep existing).
+        to: New recipient (or None to keep existing).
+        cc: New CC (or None to keep existing).
+        bcc: New BCC (or None to keep existing).
+        body_format: 'plain' or 'html'.
+        attachment_paths: List of file paths to attach (replaces existing).
+
+    Returns:
+        Confirmation message.
+    """
+    logger.info(f"[update_draft] Draft ID: '{draft_id}'")
+
+    # Fetch existing draft to preserve fields not being updated
+    existing = (
+        service.users()
+        .drafts()
+        .get(userId="me", id=draft_id, format="full")
+        .execute()
+    )
+    existing_msg = existing.get("message", {})
+    existing_payload = existing_msg.get("payload", {})
+    existing_headers = _extract_headers(
+        existing_payload, ["Subject", "To", "Cc", "Bcc", "In-Reply-To", "References"]
+    )
+    existing_bodies = _extract_message_bodies(existing_payload)
+    existing_thread_id = existing_msg.get("threadId")
+
+    # Use provided values or fall back to existing
+    final_subject = subject if subject is not None else existing_headers.get("Subject", "")
+    final_to = to if to is not None else existing_headers.get("To")
+    final_cc = cc if cc is not None else existing_headers.get("Cc")
+    final_bcc = bcc if bcc is not None else existing_headers.get("Bcc")
+    final_body = body if body is not None else (
+        existing_bodies.get("text/plain") or existing_bodies.get("text/html", "")
+    )
+
+    raw_message, _ = _prepare_gmail_message(
+        subject=final_subject,
+        body=final_body,
+        body_format=body_format,
+        to=final_to,
+        cc=final_cc,
+        bcc=final_bcc,
+        thread_id=existing_thread_id,
+        in_reply_to=existing_headers.get("In-Reply-To"),
+        references=existing_headers.get("References"),
+        attachment_paths=attachment_paths,
+    )
+
+    draft_body = {"message": {"raw": raw_message}}
+    if existing_thread_id:
+        draft_body["message"]["threadId"] = existing_thread_id
+
+    updated = (
+        service.users()
+        .drafts()
+        .update(userId="me", id=draft_id, body=draft_body)
+        .execute()
+    )
+
+    return f"Draft updated! Draft ID: {updated.get('id')}"
+
+
+def delete_draft(service, draft_id: str) -> str:
+    """
+    Delete a draft.
+
+    Args:
+        service: Authenticated Gmail API service.
+        draft_id: The ID of the draft to delete.
+
+    Returns:
+        Confirmation message.
+    """
+    logger.info(f"[delete_draft] Draft ID: '{draft_id}'")
+
+    (
+        service.users()
+        .drafts()
+        .delete(userId="me", id=draft_id)
+        .execute()
+    )
+
+    return f"Draft '{draft_id}' deleted."
+
+
+def send_draft(service, draft_id: str) -> str:
+    """
+    Send an existing draft.
+
+    Args:
+        service: Authenticated Gmail API service.
+        draft_id: The ID of the draft to send.
+
+    Returns:
+        Confirmation message with sent message ID.
+    """
+    logger.info(f"[send_draft] Draft ID: '{draft_id}'")
+
+    sent = (
+        service.users()
+        .drafts()
+        .send(userId="me", body={"id": draft_id})
+        .execute()
+    )
+
+    message_id = sent.get("id", "")
+    return f"Draft sent! Message ID: {message_id}"
