@@ -23,10 +23,16 @@ Services: `auth`, `gmail`, `drive`, `docs`, `sheets`, `calendar`, `forms`, `slid
 ### Auth
 
 ```bash
-gw auth login
-gw auth status
-gw auth logout
+gw auth login      # Opens browser for Google OAuth consent
+gw auth status     # Show current auth state (user, scopes, token expiry)
+gw auth logout     # Remove stored credentials from Keychain
 ```
+
+Authentication notes:
+- Credentials are stored in macOS Keychain and refreshed automatically.
+- If a command returns a 401 or `RefreshError`, run `gw auth login` to re-authenticate.
+- `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` env vars must be set for login.
+- After login, subsequent commands work without env vars (credentials embed the client info).
 
 ### Gmail
 

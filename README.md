@@ -23,9 +23,26 @@ chmod +x ~/.local/bin/gw
 
 Ensure `~/.local/bin` is in your `PATH`.
 
-## Setup
+## Google Cloud Project Setup
 
-Set your Google OAuth credentials:
+You need a GCP project with OAuth credentials. One-time setup:
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com/) and create a project (or use an existing one)
+2. Enable the APIs you need:
+   - [Gmail API](https://console.cloud.google.com/apis/library/gmail.googleapis.com)
+   - [Google Drive API](https://console.cloud.google.com/apis/library/drive.googleapis.com)
+   - [Google Docs API](https://console.cloud.google.com/apis/library/docs.googleapis.com)
+   - [Google Sheets API](https://console.cloud.google.com/apis/library/sheets.googleapis.com)
+   - [Google Calendar API](https://console.cloud.google.com/apis/library/calendar-json.googleapis.com)
+   - [Google Forms API](https://console.cloud.google.com/apis/library/forms.googleapis.com)
+   - [Google Slides API](https://console.cloud.google.com/apis/library/slides.googleapis.com)
+3. Go to **APIs & Services > Credentials > Create Credentials > OAuth client ID**
+4. Choose **Desktop app** as the application type
+5. Copy the **Client ID** and **Client Secret**
+
+## Authentication
+
+Set your OAuth credentials as environment variables:
 
 ```bash
 export GOOGLE_OAUTH_CLIENT_ID="your-client-id"
@@ -38,7 +55,15 @@ Then authenticate:
 gw auth login
 ```
 
-This opens a browser for Google OAuth consent and stores credentials in macOS Keychain.
+This opens a browser for Google OAuth consent and stores credentials in macOS Keychain. After login, the env vars are no longer needed — credentials are refreshed automatically.
+
+To check status or re-authenticate:
+
+```bash
+gw auth status    # Check current auth state
+gw auth login     # Re-authenticate (e.g., after token revocation)
+gw auth logout    # Remove stored credentials
+```
 
 ## Usage
 
