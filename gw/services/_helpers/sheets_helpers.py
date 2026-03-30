@@ -9,7 +9,8 @@ import json
 import re
 from typing import List, Optional, Union
 
-from core.utils import UserInputError
+class UserInputError(Exception):
+    pass
 
 
 A1_PART_REGEX = re.compile(r"^([A-Za-z]*)(\d*)$")

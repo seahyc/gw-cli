@@ -225,12 +225,8 @@ def get_doc_content(drive_service, docs_service, file_id: str = "") -> str:
 
         file_content_bytes = fh.getvalue()
 
-        # Try to extract text from office XML formats
-        try:
-            from core.utils import extract_office_xml_text
-            office_text = extract_office_xml_text(file_content_bytes, mime_type)
-        except ImportError:
-            office_text = None
+        # Office XML text extraction (not supported in CLI mode)
+        office_text = None
 
         if office_text:
             body_text = office_text

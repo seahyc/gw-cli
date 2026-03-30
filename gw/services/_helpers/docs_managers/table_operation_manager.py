@@ -8,9 +8,9 @@ multiple Google Docs API calls for complex table manipulations.
 import logging
 from typing import List, Dict, Any, Tuple
 
-from gdocs.docs_helpers import create_insert_table_request
-from gdocs.docs_structure import find_tables
-from gdocs.docs_tables import validate_table_data
+from gw.services._helpers.docs_helpers import create_insert_table_request
+from gw.services._helpers.docs_structure import find_tables
+from gw.services._helpers.docs_tables import validate_table_data
 
 logger = logging.getLogger(__name__)
 

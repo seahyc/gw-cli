@@ -8,7 +8,7 @@ extracting complex validation and request building logic.
 import logging
 from typing import Any, Union, Dict, List, Tuple
 
-from gdocs.docs_helpers import (
+from gw.services._helpers.docs_helpers import (
     create_insert_text_request,
     create_delete_range_request,
     create_format_text_request,

@@ -8,7 +8,7 @@ extracting validation patterns from individual tool functions.
 import logging
 from typing import Dict, Any, List, Tuple, Optional
 
-from gdocs.docs_helpers import validate_operation
+from gw.services._helpers.docs_helpers import validate_operation
 
 logger = logging.getLogger(__name__)
 
