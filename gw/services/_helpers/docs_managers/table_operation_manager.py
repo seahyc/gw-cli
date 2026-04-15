@@ -15,6 +15,18 @@ from gw.services._helpers.docs_tables import validate_table_data
 logger = logging.getLogger(__name__)
 
 
+def _find_tab_body(tabs, target_tab_id):
+    """Recursively find a tab's body content by tab ID."""
+    for tab in tabs or []:
+        props = tab.get("tabProperties", {}) or {}
+        if props.get("tabId") == target_tab_id:
+            return tab.get("documentTab", {}).get("body", {})
+        found = _find_tab_body(tab.get("childTabs", []), target_tab_id)
+        if found is not None:
+            return found
+    return None
+
+
 class TableOperationManager:
     """
     High-level manager for Google Docs table operations.
@@ -40,6 +52,7 @@ class TableOperationManager:
         table_data: List[List[str]],
         index: int,
         bold_headers: bool = True,
+        tab_id: str = None,
     ) -> Tuple[bool, str, Dict[str, Any]]:
         """
         Creates a table and populates it with data in a reliable multi-step process.
@@ -69,16 +82,16 @@ class TableOperationManager:
 
         try:
             # Step 1: Create empty table
-            self._create_empty_table(document_id, index, rows, cols)
+            self._create_empty_table(document_id, index, rows, cols, tab_id=tab_id)
 
             # Step 2: Get fresh document structure to find actual cell positions
-            fresh_tables = self._get_document_tables(document_id)
+            fresh_tables = self._get_document_tables(document_id, tab_id=tab_id)
             if not fresh_tables:
                 return False, "Could not find table after creation", {}
 
             # Step 3: Populate each cell with proper index refreshing
             population_count = self._populate_table_cells(
-                document_id, table_data, bold_headers
+                document_id, table_data, bold_headers, tab_id=tab_id
             )
 
             metadata = {
@@ -99,23 +112,43 @@ class TableOperationManager:
             return False, f"Table creation failed: {str(e)}", {}
 
     def _create_empty_table(
-        self, document_id: str, index: int, rows: int, cols: int
+        self, document_id: str, index: int, rows: int, cols: int, tab_id: str = None
     ) -> None:
         """Create an empty table at the specified index."""
-        logger.debug(f"Creating {rows}x{cols} table at index {index}")
+        logger.debug(f"Creating {rows}x{cols} table at index {index}, tab_id={tab_id}")
+
+        req = create_insert_table_request(index, rows, cols)
+        if tab_id:
+            req["insertTable"]["location"]["tabId"] = tab_id
 
         (
 
             self.service.documents()
             .batchUpdate(
                 documentId=document_id,
-                body={"requests": [create_insert_table_request(index, rows, cols)]},
+                body={"requests": [req]},
             )
             .execute()
         )
 
-    def _get_document_tables(self, document_id: str) -> List[Dict[str, Any]]:
-        """Get fresh document structure and extract table information."""
+    def _get_document_tables(self, document_id: str, tab_id: str = None) -> List[Dict[str, Any]]:
+        """Get fresh document structure and extract table information.
+
+        When tab_id is set, we inspect the requested tab's body instead of the
+        default document body.
+        """
+        if tab_id:
+            doc = (
+                self.service.documents()
+                .get(documentId=document_id, includeTabsContent=True)
+                .execute()
+            )
+            tab_body = _find_tab_body(doc.get("tabs", []), tab_id)
+            if tab_body is None:
+                return []
+            # find_tables expects a dict with a 'body' key
+            return find_tables({"body": tab_body})
+
         doc = (
 
             self.service.documents().get(documentId=document_id).execute()
@@ -123,7 +156,7 @@ class TableOperationManager:
         return find_tables(doc)
 
     def _populate_table_cells(
-        self, document_id: str, table_data: List[List[str]], bold_headers: bool
+        self, document_id: str, table_data: List[List[str]], bold_headers: bool, tab_id: str = None
     ) -> int:
         """
         Populate table cells with data, refreshing structure after each insertion.
@@ -148,6 +181,7 @@ class TableOperationManager:
                         col_idx,
                         cell_text,
                         bold_headers and row_idx == 0,
+                        tab_id=tab_id,
                     )
 
                     if success:
@@ -170,6 +204,7 @@ class TableOperationManager:
         col_idx: int,
         cell_text: str,
         apply_bold: bool = False,
+        tab_id: str = None,
     ) -> bool:
         """
         Populate a single cell with text, with optional bold formatting.
@@ -178,7 +213,7 @@ class TableOperationManager:
         """
         try:
             # Get fresh table structure to avoid index shifting issues
-            tables = self._get_document_tables(document_id)
+            tables = self._get_document_tables(document_id, tab_id=tab_id)
             if not tables:
                 return False
 
@@ -197,6 +232,10 @@ class TableOperationManager:
                 logger.warning(f"No insertion_index for cell ({row_idx},{col_idx})")
                 return False
 
+            insert_location = {"index": insertion_index}
+            if tab_id:
+                insert_location["tabId"] = tab_id
+
             # Insert text
             (
 
@@ -207,7 +246,7 @@ class TableOperationManager:
                         "requests": [
                             {
                                 "insertText": {
-                                    "location": {"index": insertion_index},
+                                    "location": insert_location,
                                     "text": cell_text,
                                 }
                             }
@@ -220,7 +259,8 @@ class TableOperationManager:
             # Apply bold formatting if requested
             if apply_bold:
                 self._apply_bold_formatting(
-                    document_id, insertion_index, insertion_index + len(cell_text)
+                    document_id, insertion_index, insertion_index + len(cell_text),
+                    tab_id=tab_id,
                 )
 
             return True
@@ -230,9 +270,12 @@ class TableOperationManager:
             return False
 
     def _apply_bold_formatting(
-        self, document_id: str, start_index: int, end_index: int
+        self, document_id: str, start_index: int, end_index: int, tab_id: str = None
     ) -> None:
         """Apply bold formatting to a text range."""
+        range_obj = {"startIndex": start_index, "endIndex": end_index}
+        if tab_id:
+            range_obj["tabId"] = tab_id
         (
 
             self.service.documents()
@@ -242,10 +285,7 @@ class TableOperationManager:
                     "requests": [
                         {
                             "updateTextStyle": {
-                                "range": {
-                                    "startIndex": start_index,
-                                    "endIndex": end_index,
-                                },
+                                "range": range_obj,
                                 "textStyle": {"bold": True},
                                 "fields": "bold",
                             }

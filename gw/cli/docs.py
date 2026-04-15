@@ -14,7 +14,39 @@ from gw.services import docs
 def cmd_read(args):
     try:
         drive_service, docs_service = get_services("drive", "docs")
-        result = docs.get_doc_content(drive_service, docs_service, args.file_id)
+        result = docs.get_doc_content(
+            drive_service, docs_service, args.file_id, tab_id=args.tab_id,
+        )
+        success(result)
+    except Exception as e:
+        error(str(e))
+
+
+def cmd_list_tabs(args):
+    try:
+        service = get_service("docs")
+        result = docs.list_tabs(service, args.file_id)
+        success(result)
+    except Exception as e:
+        error(str(e))
+
+
+def cmd_create_tab(args):
+    try:
+        service = get_service("docs")
+        result = docs.create_tab(
+            service, args.file_id,
+            title=args.title, index=args.index, parent_tab_id=args.parent_tab_id,
+        )
+        success(result)
+    except Exception as e:
+        error(str(e))
+
+
+def cmd_delete_tab(args):
+    try:
+        service = get_service("docs")
+        result = docs.delete_tab(service, args.file_id, tab_id=args.tab_id)
         success(result)
     except Exception as e:
         error(str(e))
@@ -34,7 +66,7 @@ def cmd_edit(args):
         service = get_service("docs")
         result = docs.find_and_replace_doc(
             service, args.file_id, args.find, args.replace,
-            match_case=args.match_case,
+            match_case=args.match_case, tab_id=args.tab_id,
         )
         success(result)
     except Exception as e:
@@ -44,7 +76,10 @@ def cmd_edit(args):
 def cmd_insert_text(args):
     try:
         service = get_service("docs")
-        result = docs.modify_doc_text(service, args.file_id, start_index=args.index, text=args.text)
+        result = docs.modify_doc_text(
+            service, args.file_id, start_index=args.index, text=args.text,
+            tab_id=args.tab_id,
+        )
         success(result)
     except Exception as e:
         error(str(e))
@@ -53,7 +88,10 @@ def cmd_insert_text(args):
 def cmd_insert_table(args):
     try:
         service = get_service("docs")
-        result = docs.insert_table(service, args.file_id, index=args.index, rows=args.rows, columns=args.cols)
+        result = docs.insert_table(
+            service, args.file_id, index=args.index, rows=args.rows, columns=args.cols,
+            tab_id=args.tab_id,
+        )
         success(result)
     except Exception as e:
         error(str(e))
@@ -66,6 +104,7 @@ def cmd_create_table(args):
         result = docs.create_table_with_data(
             service, args.file_id, table_data=table_data,
             index=args.index, bold_headers=args.bold_headers,
+            tab_id=args.tab_id,
         )
         success(result)
     except json.JSONDecodeError as e:
@@ -81,6 +120,7 @@ def cmd_insert_image(args):
             docs_service, drive_service, args.file_id,
             image_source=args.url, index=args.index,
             width=args.width, height=args.height,
+            tab_id=args.tab_id,
         )
         success(result)
     except Exception as e:
@@ -96,6 +136,7 @@ def cmd_insert_list(args):
         result = docs.insert_list(
             service, args.file_id, index=args.index,
             list_type=list_type, text=text,
+            tab_id=args.tab_id,
         )
         success(result)
     except json.JSONDecodeError as e:
@@ -107,7 +148,9 @@ def cmd_insert_list(args):
 def cmd_insert_page_break(args):
     try:
         service = get_service("docs")
-        result = docs.insert_page_break(service, args.file_id, index=args.index)
+        result = docs.insert_page_break(
+            service, args.file_id, index=args.index, tab_id=args.tab_id,
+        )
         success(result)
     except Exception as e:
         error(str(e))
@@ -118,6 +161,7 @@ def cmd_insert_section_break(args):
         service = get_service("docs")
         result = docs.insert_section_break(
             service, args.file_id, index=args.index, section_type=args.type,
+            tab_id=args.tab_id,
         )
         success(result)
     except Exception as e:
@@ -127,7 +171,10 @@ def cmd_insert_section_break(args):
 def cmd_insert_footnote(args):
     try:
         service = get_service("docs")
-        result = docs.insert_footnote(service, args.file_id, index=args.index, footnote_text=args.text)
+        result = docs.insert_footnote(
+            service, args.file_id, index=args.index, footnote_text=args.text,
+            tab_id=args.tab_id,
+        )
         success(result)
     except Exception as e:
         error(str(e))
@@ -216,7 +263,9 @@ def cmd_batch_update(args):
     try:
         service = get_service("docs")
         operations = json.loads(args.requests)
-        result = docs.batch_update_doc(service, args.file_id, operations=operations)
+        result = docs.batch_update_doc(
+            service, args.file_id, operations=operations, tab_id=args.tab_id,
+        )
         success(result)
     except json.JSONDecodeError as e:
         error(f"Invalid JSON for --requests: {e}")
@@ -267,6 +316,32 @@ def cmd_search(args):
         error(str(e))
 
 
+def cmd_insert_markdown(args):
+    try:
+        service = get_service("docs")
+        if args.content is not None:
+            md_text = args.content
+        elif args.file:
+            with open(args.file, "r", encoding="utf-8") as f:
+                md_text = f.read()
+        else:
+            error("Either --file or --content is required.")
+            return
+        result = docs.insert_markdown(
+            service,
+            args.file_id,
+            markdown_text=md_text,
+            tab_id=args.tab_id,
+            start_index=args.index,
+            replace=args.replace,
+        )
+        success(result)
+    except FileNotFoundError as e:
+        error(f"Markdown file not found: {e}")
+    except Exception as e:
+        error(str(e))
+
+
 def cmd_list_in_folder(args):
     try:
         service = get_service("drive")
@@ -290,7 +365,27 @@ def register(subparsers):
     # read
     p = docs_sub.add_parser("read", help="Read a Google Doc's content")
     p.add_argument("file_id", help="Document or file ID")
+    p.add_argument("--tab-id", help="If set, read only the specified tab")
     p.set_defaults(func=cmd_read)
+
+    # list-tabs
+    p = docs_sub.add_parser("list-tabs", help="List all tabs in a Google Doc")
+    p.add_argument("file_id", help="Document ID")
+    p.set_defaults(func=cmd_list_tabs)
+
+    # create-tab
+    p = docs_sub.add_parser("create-tab", help="Create a new tab in a Google Doc")
+    p.add_argument("file_id", help="Document ID")
+    p.add_argument("--title", required=True, help="Tab title")
+    p.add_argument("--index", type=int, help="Zero-based position among sibling tabs")
+    p.add_argument("--parent-tab-id", help="Parent tab ID (creates a nested child tab)")
+    p.set_defaults(func=cmd_create_tab)
+
+    # delete-tab
+    p = docs_sub.add_parser("delete-tab", help="Delete a tab from a Google Doc")
+    p.add_argument("file_id", help="Document ID")
+    p.add_argument("--tab-id", required=True, help="ID of the tab to delete")
+    p.set_defaults(func=cmd_delete_tab)
 
     # inspect
     p = docs_sub.add_parser("inspect", help="Inspect document structure")
@@ -304,6 +399,7 @@ def register(subparsers):
     p.add_argument("--find", required=True, help="Text to find")
     p.add_argument("--replace", required=True, help="Replacement text")
     p.add_argument("--match-case", action="store_true", help="Case-sensitive matching")
+    p.add_argument("--tab-id", help="If set, scope the replace to this tab only")
     p.set_defaults(func=cmd_edit)
 
     # insert-text
@@ -311,6 +407,7 @@ def register(subparsers):
     p.add_argument("file_id", help="Document ID")
     p.add_argument("--text", required=True, help="Text to insert")
     p.add_argument("--index", type=int, default=0, help="Insertion index (default: 0)")
+    p.add_argument("--tab-id", help="If set, insert into this tab instead of the default tab")
     p.set_defaults(func=cmd_insert_text)
 
     # insert-table
@@ -319,6 +416,7 @@ def register(subparsers):
     p.add_argument("--rows", type=int, required=True, help="Number of rows")
     p.add_argument("--cols", type=int, required=True, help="Number of columns")
     p.add_argument("--index", type=int, default=0, help="Insertion index")
+    p.add_argument("--tab-id", help="If set, insert into this tab instead of the default tab")
     p.set_defaults(func=cmd_insert_table)
 
     # create-table (with data)
@@ -327,6 +425,7 @@ def register(subparsers):
     p.add_argument("--data", required=True, help="2D JSON array of cell strings")
     p.add_argument("--index", type=int, default=0, help="Insertion index")
     p.add_argument("--bold-headers", action="store_true", default=True, help="Bold the first row (default: true)")
+    p.add_argument("--tab-id", help="If set, insert into this tab instead of the default tab")
     p.set_defaults(func=cmd_create_table)
 
     # insert-image
@@ -336,6 +435,7 @@ def register(subparsers):
     p.add_argument("--index", type=int, default=0, help="Insertion index")
     p.add_argument("--width", type=int, default=0, help="Width in points")
     p.add_argument("--height", type=int, default=0, help="Height in points")
+    p.add_argument("--tab-id", help="If set, insert into this tab instead of the default tab")
     p.set_defaults(func=cmd_insert_image)
 
     # insert-list
@@ -344,12 +444,14 @@ def register(subparsers):
     p.add_argument("--items", required=True, help='JSON array of list items, e.g. \'["a","b","c"]\'')
     p.add_argument("--index", type=int, default=0, help="Insertion index")
     p.add_argument("--ordered", action="store_true", help="Numbered list instead of bullets")
+    p.add_argument("--tab-id", help="If set, insert into this tab instead of the default tab")
     p.set_defaults(func=cmd_insert_list)
 
     # insert-page-break
     p = docs_sub.add_parser("insert-page-break", help="Insert a page break")
     p.add_argument("file_id", help="Document ID")
     p.add_argument("--index", type=int, default=0, help="Insertion index")
+    p.add_argument("--tab-id", help="If set, insert into this tab instead of the default tab")
     p.set_defaults(func=cmd_insert_page_break)
 
     # insert-section-break
@@ -357,6 +459,7 @@ def register(subparsers):
     p.add_argument("file_id", help="Document ID")
     p.add_argument("--index", type=int, default=0, help="Insertion index")
     p.add_argument("--type", default="NEXT_PAGE", choices=["NEXT_PAGE", "CONTINUOUS"], help="Section break type")
+    p.add_argument("--tab-id", help="If set, insert into this tab instead of the default tab")
     p.set_defaults(func=cmd_insert_section_break)
 
     # insert-footnote
@@ -364,6 +467,7 @@ def register(subparsers):
     p.add_argument("file_id", help="Document ID")
     p.add_argument("--index", type=int, required=True, help="Index for the footnote reference")
     p.add_argument("--text", required=True, help="Footnote body text")
+    p.add_argument("--tab-id", help="If set, insert into this tab instead of the default tab")
     p.set_defaults(func=cmd_insert_footnote)
 
     # delete-object
@@ -436,6 +540,7 @@ def register(subparsers):
     p = docs_sub.add_parser("batch-update", help="Execute raw batch update operations")
     p.add_argument("file_id", help="Document ID")
     p.add_argument("--requests", required=True, help="JSON array of operation objects")
+    p.add_argument("--tab-id", help="If set, scope all operations to this tab")
     p.set_defaults(func=cmd_batch_update)
 
     # header-footer
@@ -464,6 +569,25 @@ def register(subparsers):
     p.add_argument("query", help="Search query")
     p.add_argument("--max-results", type=int, default=10, help="Maximum results (default: 10)")
     p.set_defaults(func=cmd_search)
+
+    # insert-markdown
+    p = docs_sub.add_parser(
+        "insert-markdown",
+        help="Convert a markdown file/string into native Google Docs formatting",
+    )
+    p.add_argument("file_id", help="Document ID")
+    p.add_argument("--file", help="Path to a local markdown file")
+    p.add_argument("--content", help="Markdown content as a string (alternative to --file)")
+    p.add_argument("--tab-id", help="If set, target this tab instead of the default body")
+    p.add_argument(
+        "--index", type=int, default=1,
+        help="Insertion index (default: 1, i.e. beginning). Ignored when --replace is set.",
+    )
+    p.add_argument(
+        "--replace", action="store_true",
+        help="Clear all existing content in the target (tab or whole doc) before inserting",
+    )
+    p.set_defaults(func=cmd_insert_markdown)
 
     # list-in-folder
     p = docs_sub.add_parser("list-in-folder", help="List Google Docs in a Drive folder")

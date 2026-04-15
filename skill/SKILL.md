@@ -101,29 +101,55 @@ gw drive share <file_id> --email colleague@company.com --role writer
 ### Docs
 
 ```bash
-gw docs read <file_id>
+gw docs read <file_id> [--tab-id ID]
+gw docs list-tabs <file_id>
+gw docs create-tab <file_id> --title TITLE [--index N] [--parent-tab-id ID]
+gw docs delete-tab <file_id> --tab-id ID
 gw docs inspect <file_id> [--detailed]
 gw docs search <query> [--max-results N]
 gw docs list-in-folder [--folder-id ID] [--max-results N]
 gw docs create --title TITLE [--content TEXT]
-gw docs edit <file_id> --find TEXT --replace TEXT [--match-case]
-gw docs insert-text <file_id> --text TEXT --index N
-gw docs insert-table <file_id> --rows N --cols N [--index N]
-gw docs create-table <file_id> --data JSON [--index N] [--bold-headers]
-gw docs insert-image <file_id> --url URL [--index N] [--width N] [--height N]
-gw docs insert-list <file_id> --items JSON [--index N] [--ordered]
-gw docs insert-page-break <file_id> [--index N]
-gw docs insert-section-break <file_id> [--index N] [--type NEXT_PAGE|CONTINUOUS]
-gw docs insert-footnote <file_id> --index N --text TEXT
+gw docs edit <file_id> --find TEXT --replace TEXT [--match-case] [--tab-id ID]
+gw docs insert-text <file_id> --text TEXT --index N [--tab-id ID]
+gw docs insert-table <file_id> --rows N --cols N [--index N] [--tab-id ID]
+gw docs create-table <file_id> --data JSON [--index N] [--bold-headers] [--tab-id ID]
+gw docs insert-image <file_id> --url URL [--index N] [--width N] [--height N] [--tab-id ID]
+gw docs insert-list <file_id> --items JSON [--index N] [--ordered] [--tab-id ID]
+gw docs insert-markdown <file_id> --file PATH | --content STRING [--tab-id ID] [--index N] [--replace]
+gw docs insert-page-break <file_id> [--index N] [--tab-id ID]
+gw docs insert-section-break <file_id> [--index N] [--type NEXT_PAGE|CONTINUOUS] [--tab-id ID]
+gw docs insert-footnote <file_id> --index N --text TEXT [--tab-id ID]
 gw docs delete-object <file_id> --object-id ID
 gw docs update-paragraph-style <file_id> --start N --end N [style flags]
 gw docs update-document-style <file_id> [margin/page/font flags]
 gw docs manage-named-range <file_id> --action create|delete --name NAME [--start N --end N]
 gw docs manage-table <file_id> --action ACTION --table-index N [flags]
 gw docs debug-table <file_id> --table-index N
-gw docs batch-update <file_id> --requests JSON
+gw docs batch-update <file_id> --requests JSON [--tab-id ID]
 gw docs header-footer <file_id> --action get|create|delete [--type header|footer] [--content TEXT]
 gw docs export-pdf <file_id> [--output PATH] [--folder-id ID]
+```
+
+#### Tabs
+
+Google Docs supports multiple tabs per document. Use `list-tabs` to discover them, `create-tab` to add new ones, and `delete-tab` to remove them. Pass `--tab-id` on read/write commands to scope the operation to a specific tab; without it the commands target the default tab (and `read` returns all tabs concatenated, preserving historical behavior).
+
+```bash
+# Discover tabs
+gw docs list-tabs <file_id>
+
+# Create a new top-level tab and capture its ID
+gw docs create-tab <file_id> --title "Draft notes"
+
+# Create a nested child tab under an existing parent
+gw docs create-tab <file_id> --title "Subsection" --parent-tab-id <parent_tab_id>
+
+# Delete a tab by ID (Google Docs requires at least one tab to remain)
+gw docs delete-tab <file_id> --tab-id <tab_id>
+
+# Read or write a specific tab
+gw docs read <file_id> --tab-id <tab_id>
+gw docs insert-text <file_id> --text "Hello" --index 1 --tab-id <tab_id>
 ```
 
 Typical workflow:
@@ -138,6 +164,31 @@ gw docs edit <file_id> --find "old text" --replace "new text"
 # Insert structured content
 gw docs create-table <file_id> --data '[["Name","Status"],["Alice","Done"]]' --bold-headers
 ```
+
+#### Markdown -> native Docs formatting
+
+`gw docs insert-markdown` converts a markdown file (or string) into native
+Google Docs formatting: real headings, bullets, tables, inline bold, and inline
+monospace for `` `code` ``. Useful for dropping a long markdown doc into a
+Google Doc without the syntax leaking through.
+
+```bash
+# Replace the entire contents of a tab with a formatted markdown file
+gw docs insert-markdown <file_id> --file ./brief.md --tab-id <tab_id> --replace
+
+# Append markdown to the end of a doc (compute index from `inspect` or read)
+gw docs insert-markdown <file_id> --file ./appendix.md --index 1234
+
+# Inline content instead of a file
+gw docs insert-markdown <file_id> --content "# Hello\n\nWorld" --replace
+```
+
+Supported subset: `#`..`######` headings, paragraphs, `-` bullet lists,
+`> blockquotes` (rendered as italic + 36pt left indent), GitHub-style pipe
+tables (first row bolded), `**bold**`, `` `code` `` (Roboto Mono). Horizontal
+rules (`---`) are intentionally skipped — heading/paragraph spacing is
+sufficient. Not supported: nested/ordered lists, images, links, fenced code
+blocks, raw HTML.
 
 #### Anchored comments on Docs
 

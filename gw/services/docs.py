@@ -34,8 +34,218 @@ from gw.services._helpers.docs_managers import (
     ValidationManager,
     BatchOperationManager,
 )
+from gw.services._helpers.docs_markdown import (
+    parse_markdown,
+    build_heading_block,
+    build_paragraph_block,
+    build_list_block,
+    build_quote_block,
+)
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Tab helpers
+# ---------------------------------------------------------------------------
+
+# Request-type -> list of key paths (relative to the request body) where a
+# Location or Range object lives. We inject tabId into each of these so that
+# write operations target a specific tab instead of the default tab.
+_TAB_TARGETS = {
+    "insertText": ["location"],
+    "deleteContentRange": ["range"],
+    "updateTextStyle": ["range"],
+    "updateParagraphStyle": ["range"],
+    "insertTable": ["location"],
+    "insertTableRow": ["tableCellLocation.tableStartLocation"],
+    "insertTableColumn": ["tableCellLocation.tableStartLocation"],
+    "deleteTableRow": ["tableCellLocation.tableStartLocation"],
+    "deleteTableColumn": ["tableCellLocation.tableStartLocation"],
+    "mergeTableCells": ["tableRange.tableCellLocation.tableStartLocation"],
+    "unmergeTableCells": ["tableRange.tableCellLocation.tableStartLocation"],
+    "insertPageBreak": ["location"],
+    "insertSectionBreak": ["location"],
+    "insertInlineImage": ["location"],
+    "createFootnote": ["location"],
+    "createParagraphBullets": ["range"],
+    "deleteParagraphBullets": ["range"],
+    "createNamedRange": ["range"],
+    "deletePositionedObject": [],  # objectId-based, no location
+    "updateTableCellStyle": ["tableRange.tableCellLocation.tableStartLocation"],
+    "updateTableColumnProperties": ["tableStartLocation"],
+    "updateTableRowStyle": ["tableStartLocation"],
+    "pinTableHeaderRows": ["tableStartLocation"],
+}
+
+
+def _set_by_path(container, path, key, value):
+    """Navigate dotted path inside container (creating dicts as needed) and set key=value."""
+    node = container
+    if path:
+        for part in path.split("."):
+            if part not in node or not isinstance(node[part], dict):
+                node[part] = {}
+            node = node[part]
+    node[key] = value
+
+
+def _apply_tab_id_to_request(request, tab_id):
+    """Inject tabId into a single Docs API request (mutates in place)."""
+    if not tab_id:
+        return request
+    for op_name, op_body in request.items():
+        if not isinstance(op_body, dict):
+            continue
+        # replaceAllText uses tabsCriteria to scope to specific tabs
+        if op_name == "replaceAllText":
+            op_body["tabsCriteria"] = {"tabIds": [tab_id]}
+            continue
+        targets = _TAB_TARGETS.get(op_name)
+        if targets is None:
+            # Default: if the body has a 'location' or 'range' dict, tag it
+            if isinstance(op_body.get("location"), dict):
+                op_body["location"]["tabId"] = tab_id
+            if isinstance(op_body.get("range"), dict):
+                op_body["range"]["tabId"] = tab_id
+            continue
+        for target_path in targets:
+            _set_by_path(op_body, target_path, "tabId", tab_id)
+    return request
+
+
+def _apply_tab_id(requests, tab_id):
+    """Inject tabId into all requests in a list (mutates and returns the list)."""
+    if not tab_id:
+        return requests
+    for req in requests:
+        _apply_tab_id_to_request(req, tab_id)
+    return requests
+
+
+# ---------------------------------------------------------------------------
+# Tabs: list / create
+# ---------------------------------------------------------------------------
+
+def list_tabs(service, file_id: str = "") -> str:
+    """List all tabs (including nested child tabs) in a Google Doc. Returns JSON array."""
+    logger.info(f"[list_tabs] Doc={file_id}")
+
+    doc = (
+        service.documents()
+        .get(documentId=file_id, includeTabsContent=True)
+        .execute()
+    )
+
+    def walk(tabs, parent_id=None, depth=0):
+        out = []
+        for tab in tabs or []:
+            props = tab.get("tabProperties", {}) or {}
+            tab_id = props.get("tabId", "")
+            out.append({
+                "tabId": tab_id,
+                "title": props.get("title", ""),
+                "index": props.get("index", 0),
+                "parentTabId": parent_id,
+                "depth": depth,
+            })
+            out.extend(walk(tab.get("childTabs", []), parent_id=tab_id, depth=depth + 1))
+        return out
+
+    tabs = walk(doc.get("tabs", []))
+    return json.dumps(tabs, indent=2)
+
+
+def create_tab(
+    service,
+    file_id: str = "",
+    title: str = "",
+    index: int = None,
+    parent_tab_id: str = None,
+) -> str:
+    """Create a new tab in a Google Doc. Returns the new tab's ID as JSON."""
+    logger.info(
+        f"[create_tab] Doc={file_id}, title='{title}', index={index}, parent={parent_tab_id}"
+    )
+
+    if not title:
+        return "Error: 'title' is required."
+
+    tab_props = {"title": title}
+    if index is not None:
+        tab_props["index"] = index
+    if parent_tab_id:
+        tab_props["parentTabId"] = parent_tab_id
+
+    request = {"addDocumentTab": {"tabProperties": tab_props}}
+
+    result = (
+        service.documents()
+        .batchUpdate(documentId=file_id, body={"requests": [request]})
+        .execute()
+    )
+
+    new_tab_id = ""
+    if "replies" in result and result["replies"]:
+        reply = result["replies"][0]
+        # The reply key mirrors the request type; tabId lives inside tabProperties
+        if "addDocumentTab" in reply:
+            tab_props_reply = reply["addDocumentTab"].get("tabProperties", {})
+            new_tab_id = tab_props_reply.get("tabId", "")
+
+    return json.dumps(
+        {
+            "tabId": new_tab_id,
+            "title": title,
+            "index": index,
+            "parentTabId": parent_tab_id,
+        },
+        indent=2,
+    )
+
+
+def delete_tab(service, file_id: str = "", tab_id: str = "") -> str:
+    """Delete a tab from a Google Doc. Returns JSON confirmation."""
+    logger.info(f"[delete_tab] Doc={file_id}, tab_id={tab_id}")
+
+    if not tab_id:
+        return "Error: 'tab_id' is required."
+
+    # Pre-flight: verify the tab exists and ensure we're not deleting the last one.
+    doc = (
+        service.documents()
+        .get(documentId=file_id, includeTabsContent=True)
+        .execute()
+    )
+
+    def collect(tabs):
+        out = []
+        for tab in tabs or []:
+            props = tab.get("tabProperties", {}) or {}
+            out.append(props.get("tabId", ""))
+            out.extend(collect(tab.get("childTabs", [])))
+        return out
+
+    all_tab_ids = collect(doc.get("tabs", []))
+
+    if tab_id not in all_tab_ids:
+        return f"Error: tab '{tab_id}' not found in document {file_id}."
+
+    # Only block deletion when tab_id is the sole top-level tab AND there are
+    # no child tabs elsewhere. Google Docs requires at least one tab in the doc.
+    if len(all_tab_ids) <= 1:
+        return (
+            f"Error: cannot delete the only tab in document {file_id}. "
+            "Google Docs requires at least one tab."
+        )
+
+    request = {"deleteTab": {"tabId": tab_id}}
+
+    service.documents().batchUpdate(
+        documentId=file_id, body={"requests": [request]}
+    ).execute()
+
+    return json.dumps({"deleted": True, "tabId": tab_id}, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -101,9 +311,12 @@ def list_docs_in_folder(service, folder_id: str = "root", page_size: int = 100) 
 # Read / Inspect
 # ---------------------------------------------------------------------------
 
-def get_doc_content(drive_service, docs_service, file_id: str = "") -> str:
-    """Retrieve content of a Google Doc or Drive file (.docx). Returns text with metadata header."""
-    logger.info(f"[get_doc_content] Document/File ID: '{file_id}'")
+def get_doc_content(drive_service, docs_service, file_id: str = "", tab_id: str = None) -> str:
+    """Retrieve content of a Google Doc or Drive file (.docx). Returns text with metadata header.
+
+    If tab_id is provided, only that tab's content is returned.
+    """
+    logger.info(f"[get_doc_content] Document/File ID: '{file_id}', tab_id={tab_id}")
 
     # Get file metadata from Drive
     file_metadata = (
@@ -164,37 +377,47 @@ def get_doc_content(drive_service, docs_service, file_id: str = "") -> str:
                                 text_lines.append(cell_text)
             return "".join(text_lines)
 
-        def process_tab_hierarchy(tab, level=0):
+        def process_tab_hierarchy(tab, level=0, target_tab_id=None):
             tab_text = ""
-            if "documentTab" in tab:
-                props = tab.get("tabProperties", {})
+            props = tab.get("tabProperties", {})
+            this_tab_id = props.get("tabId", "Unknown ID")
+            # When target_tab_id is set, only emit content for that tab (still
+            # recurse into children so the target can be a nested tab).
+            if "documentTab" in tab and (target_tab_id is None or this_tab_id == target_tab_id):
                 tab_title = props.get("title", "Untitled Tab")
-                tab_id = props.get("tabId", "Unknown ID")
                 if level > 0:
-                    tab_title = "    " * level + f"{tab_title} ( ID: {tab_id})"
+                    tab_title = "    " * level + f"{tab_title} ( ID: {this_tab_id})"
                 tab_body = tab.get("documentTab", {}).get("body", {}).get("content", [])
                 tab_text += extract_text_from_elements(tab_body, tab_title)
 
             child_tabs = tab.get("childTabs", [])
             for child_tab in child_tabs:
-                tab_text += process_tab_hierarchy(child_tab, level + 1)
+                tab_text += process_tab_hierarchy(child_tab, level + 1, target_tab_id)
 
             return tab_text
 
         processed_text_lines = []
 
-        # Process main document body
-        body_elements = doc_data.get("body", {}).get("content", [])
-        main_content = extract_text_from_elements(body_elements)
-        if main_content.strip():
-            processed_text_lines.append(main_content)
+        if tab_id:
+            # Only emit the requested tab's content.
+            tabs = doc_data.get("tabs", [])
+            for tab in tabs:
+                tab_content = process_tab_hierarchy(tab, target_tab_id=tab_id)
+                if tab_content.strip():
+                    processed_text_lines.append(tab_content)
+        else:
+            # Process main document body
+            body_elements = doc_data.get("body", {}).get("content", [])
+            main_content = extract_text_from_elements(body_elements)
+            if main_content.strip():
+                processed_text_lines.append(main_content)
 
-        # Process all tabs
-        tabs = doc_data.get("tabs", [])
-        for tab in tabs:
-            tab_content = process_tab_hierarchy(tab)
-            if tab_content.strip():
-                processed_text_lines.append(tab_content)
+            # Process all tabs
+            tabs = doc_data.get("tabs", [])
+            for tab in tabs:
+                tab_content = process_tab_hierarchy(tab)
+                if tab_content.strip():
+                    processed_text_lines.append(tab_content)
 
         body_text = "".join(processed_text_lines)
     else:
@@ -376,6 +599,7 @@ def modify_doc_text(
     superscript: bool = None,
     subscript: bool = None,
     link_url: str = None,
+    tab_id: str = None,
 ) -> str:
     """Insert/replace text and apply character formatting at a position in a Google Doc."""
     all_formatting = [bold, italic, underline, font_size, font_family, text_color,
@@ -508,6 +732,7 @@ def modify_doc_text(
             f"Applied formatting ({', '.join(format_details)}) to range {format_start}-{format_end}"
         )
 
+    _apply_tab_id(requests, tab_id)
     (
         service.documents()
         .batchUpdate(documentId=file_id, body={"requests": requests})
@@ -525,13 +750,15 @@ def find_and_replace_doc(
     find_text: str = "",
     replace_text: str = "",
     match_case: bool = False,
+    tab_id: str = None,
 ) -> str:
     """Find and replace all occurrences of text in a Google Doc."""
     logger.info(
-        f"[find_and_replace_doc] Doc={file_id}, find='{find_text}', replace='{replace_text}'"
+        f"[find_and_replace_doc] Doc={file_id}, find='{find_text}', replace='{replace_text}', tab_id={tab_id}"
     )
 
     requests = [create_find_replace_request(find_text, replace_text, match_case)]
+    _apply_tab_id(requests, tab_id)
 
     result = (
         service.documents()
@@ -558,9 +785,10 @@ def insert_table(
     index: int = 0,
     rows: int = 0,
     columns: int = 0,
+    tab_id: str = None,
 ) -> str:
     """Insert a table at the given index in a Google Doc."""
-    logger.info(f"[insert_table] Doc={file_id}, index={index}, rows={rows}, columns={columns}")
+    logger.info(f"[insert_table] Doc={file_id}, index={index}, rows={rows}, columns={columns}, tab_id={tab_id}")
 
     if not rows or not columns:
         return "Error: 'rows' and 'columns' are required."
@@ -569,6 +797,7 @@ def insert_table(
         index = 1
 
     requests = [create_insert_table_request(index, rows, columns)]
+    _apply_tab_id(requests, tab_id)
 
     (
         service.documents()
@@ -585,9 +814,10 @@ def insert_list(
     index: int = 0,
     list_type: str = "UNORDERED",
     text: str = "List item",
+    tab_id: str = None,
 ) -> str:
     """Insert a bullet or numbered list. list_type: UNORDERED or ORDERED."""
-    logger.info(f"[insert_list] Doc={file_id}, index={index}, list_type={list_type}")
+    logger.info(f"[insert_list] Doc={file_id}, index={index}, list_type={list_type}, tab_id={tab_id}")
 
     if index == 0:
         index = 1
@@ -596,6 +826,7 @@ def insert_list(
         create_insert_text_request(index, text + "\n"),
         create_bullet_list_request(index, index + len(text), list_type),
     ]
+    _apply_tab_id(requests, tab_id)
 
     (
         service.documents()
@@ -606,14 +837,15 @@ def insert_list(
     return f"Inserted {list_type.lower()} list at index {index}."
 
 
-def insert_page_break(service, file_id: str = "", index: int = 0) -> str:
+def insert_page_break(service, file_id: str = "", index: int = 0, tab_id: str = None) -> str:
     """Insert a page break at the given index in a Google Doc."""
-    logger.info(f"[insert_page_break] Doc={file_id}, index={index}")
+    logger.info(f"[insert_page_break] Doc={file_id}, index={index}, tab_id={tab_id}")
 
     if index == 0:
         index = 1
 
     requests = [create_insert_page_break_request(index)]
+    _apply_tab_id(requests, tab_id)
 
     (
         service.documents()
@@ -632,6 +864,7 @@ def insert_doc_image(
     index: int = 0,
     width: int = 0,
     height: int = 0,
+    tab_id: str = None,
 ) -> str:
     """Insert an image into a Google Doc from a Drive file ID or public URL."""
     logger.info(
@@ -670,6 +903,7 @@ def insert_doc_image(
         source_description = "URL image"
 
     requests = [create_insert_image_request(index, image_uri, width, height)]
+    _apply_tab_id(requests, tab_id)
 
     (
         docs_service.documents()
@@ -689,6 +923,7 @@ def insert_section_break(
     file_id: str = "",
     index: int = 0,
     section_type: str = "NEXT_PAGE",
+    tab_id: str = None,
 ) -> str:
     """Insert a section break. section_type: CONTINUOUS or NEXT_PAGE."""
     logger.info(
@@ -712,6 +947,7 @@ def insert_section_break(
             "sectionType": section_type,
         }
     }
+    _apply_tab_id_to_request(request, tab_id)
 
     (
         service.documents()
@@ -727,6 +963,7 @@ def insert_footnote(
     file_id: str = "",
     index: int = 0,
     footnote_text: str = None,
+    tab_id: str = None,
 ) -> str:
     """Insert a footnote reference at the given index, optionally with body text."""
     logger.info(
@@ -746,6 +983,7 @@ def insert_footnote(
             "location": {"index": index},
         }
     }
+    _apply_tab_id_to_request(create_request, tab_id)
 
     result = (
         service.documents()
@@ -803,6 +1041,7 @@ def create_table_with_data(
     table_data: List[List[str]] = None,
     index: int = 0,
     bold_headers: bool = True,
+    tab_id: str = None,
 ) -> str:
     """Create and populate a table in one operation."""
     logger.debug(f"[create_table_with_data] Doc={file_id}, index={index}")
@@ -824,7 +1063,7 @@ def create_table_with_data(
     table_manager = TableOperationManager(service)
 
     success, message, metadata = table_manager.create_and_populate_table(
-        file_id, table_data, index, bold_headers
+        file_id, table_data, index, bold_headers, tab_id=tab_id
     )
 
     if not success and "must be less than the end index" in message:
@@ -832,7 +1071,7 @@ def create_table_with_data(
             f"Index {index} is at document boundary, retrying with index {index - 1}"
         )
         success, message, metadata = table_manager.create_and_populate_table(
-            file_id, table_data, index - 1, bold_headers
+            file_id, table_data, index - 1, bold_headers, tab_id=tab_id
         )
 
     if success:
@@ -1314,9 +1553,10 @@ def batch_update_doc(
     service,
     file_id: str = "",
     operations: List[Dict[str, Any]] = None,
+    tab_id: str = None,
 ) -> str:
     """Execute multiple document operations in a single atomic batch."""
-    logger.debug(f"[batch_update_doc] Doc={file_id}, operations={len(operations or [])}")
+    logger.debug(f"[batch_update_doc] Doc={file_id}, operations={len(operations or [])}, tab_id={tab_id}")
 
     validator = ValidationManager()
 
@@ -1331,7 +1571,7 @@ def batch_update_doc(
     batch_manager = BatchOperationManager(service)
 
     ok, message, metadata = batch_manager.execute_batch_operations(
-        file_id, operations
+        file_id, operations, tab_id=tab_id
     )
 
     if ok:
@@ -1468,3 +1708,324 @@ def export_doc_to_pdf(
 
     except Exception as e:
         return f"Error: Failed to upload PDF to Drive: {str(e)}. PDF was generated successfully ({pdf_size:,} bytes) but could not be saved to Drive."
+
+
+# ---------------------------------------------------------------------------
+# Markdown -> native Google Docs formatting
+# ---------------------------------------------------------------------------
+
+def _find_target_tab(doc, tab_id):
+    """Return the tab matching tab_id or None. Recurses into childTabs."""
+    def walk(tabs):
+        for t in tabs or []:
+            if t.get("tabProperties", {}).get("tabId") == tab_id:
+                return t
+            found = walk(t.get("childTabs", []))
+            if found is not None:
+                return found
+        return None
+
+    return walk(doc.get("tabs", []))
+
+
+def _get_body_content(doc, tab_id):
+    """Return the body content array for the target tab.
+
+    Note: a document fetched with includeTabsContent=True may NOT populate
+    the top-level `body` field -- all content sits under `tabs[...]`. When
+    tab_id is None we fall back to the first top-level tab's body.
+    """
+    if tab_id:
+        tab = _find_target_tab(doc, tab_id)
+        if tab is None:
+            raise ValueError(f"tab_id '{tab_id}' not found in document")
+        return tab.get("documentTab", {}).get("body", {}).get("content", [])
+    # tab_id not set: prefer the document-level body if populated, otherwise
+    # fall back to the first tab's body (happens when includeTabsContent=True).
+    body_content = doc.get("body", {}).get("content", [])
+    if body_content:
+        return body_content
+    tabs = doc.get("tabs", [])
+    if tabs:
+        return tabs[0].get("documentTab", {}).get("body", {}).get("content", [])
+    return []
+
+
+def _get_body_end_index(doc, tab_id):
+    """Return the last endIndex of the body for the given tab (or default body).
+
+    Used to know the full extent of existing content before we clear/insert.
+    """
+    content = _get_body_content(doc, tab_id)
+    if not content:
+        return 1
+    return content[-1].get("endIndex", 1)
+
+
+def insert_markdown(
+    service,
+    file_id: str = "",
+    markdown_text: str = "",
+    tab_id: str = None,
+    start_index: int = 1,
+    replace: bool = False,
+) -> str:
+    """Insert markdown content into a Google Doc as native formatting.
+
+    Parameters
+    ----------
+    service : Google Docs service client
+    file_id : document ID
+    markdown_text : the markdown source
+    tab_id : optional tab ID (default: main doc body)
+    start_index : index to start inserting at (ignored if replace=True; then 1)
+    replace : if True, clear all existing content in the target first
+
+    Returns a JSON summary string.
+
+    Supported markdown subset:
+      - Headings (# .. ######) -> HEADING_1..HEADING_6
+      - Paragraphs
+      - Bullet lists (- item)
+      - Blockquotes (> text) rendered as italic + 36pt indent
+      - Tables (GitHub-flavored pipe syntax) with bold header row
+      - Inline **bold**
+      - Inline `code` (rendered in Roboto Mono)
+      - Horizontal rules (---) are skipped (heading spacing is sufficient)
+
+    Limitations: no nested lists, no ordered lists, no images/links,
+    no fenced code blocks, no raw HTML.
+    """
+    logger.info(
+        f"[insert_markdown] Doc={file_id}, tab_id={tab_id}, "
+        f"start_index={start_index}, replace={replace}, "
+        f"md_len={len(markdown_text or '')}"
+    )
+
+    if not file_id:
+        return "Error: 'file_id' is required."
+    if markdown_text is None:
+        markdown_text = ""
+
+    blocks = parse_markdown(markdown_text)
+    counts = {
+        "blocks": len(blocks),
+        "headings": sum(1 for b in blocks if b["type"] == "heading"),
+        "paragraphs": sum(1 for b in blocks if b["type"] == "paragraph"),
+        "lists": sum(1 for b in blocks if b["type"] == "list"),
+        "quotes": sum(1 for b in blocks if b["type"] == "quote"),
+        "tables": sum(1 for b in blocks if b["type"] == "table"),
+        "hr_skipped": sum(1 for b in blocks if b["type"] == "hr"),
+    }
+
+    # Step 1 (optional): clear existing content in the target.
+    if replace:
+        doc = (
+            service.documents()
+            .get(documentId=file_id, includeTabsContent=True)
+            .execute()
+        )
+        last_end = _get_body_end_index(doc, tab_id)
+        # The body always ends with a final trailing newline that cannot be
+        # deleted. Deletable range is [1, last_end - 1).
+        if last_end > 2:
+            rng = {"startIndex": 1, "endIndex": last_end - 1}
+            if tab_id:
+                rng["tabId"] = tab_id
+            clear_reqs = [
+                {"deleteContentRange": {"range": rng}},
+                {
+                    "updateParagraphStyle": {
+                        "range": (
+                            {"startIndex": 1, "endIndex": 2, "tabId": tab_id}
+                            if tab_id
+                            else {"startIndex": 1, "endIndex": 2}
+                        ),
+                        "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                        "fields": "namedStyleType",
+                    }
+                },
+            ]
+            service.documents().batchUpdate(
+                documentId=file_id, body={"requests": clear_reqs}
+            ).execute()
+        cursor = 1
+    else:
+        cursor = max(1, int(start_index or 1))
+
+    # Step 2: walk blocks. Accumulate text-based requests; flush them whenever
+    # we hit a table (tables need an insertTable call followed by a doc re-read
+    # to learn cell indices before filling cells).
+    CHUNK = 200
+    pending: List[Dict[str, Any]] = []
+
+    def flush():
+        nonlocal pending
+        if not pending:
+            return
+        for i in range(0, len(pending), CHUNK):
+            batch = pending[i:i + CHUNK]
+            service.documents().batchUpdate(
+                documentId=file_id, body={"requests": batch}
+            ).execute()
+        pending = []
+
+    for block in blocks:
+        btype = block["type"]
+        if btype == "heading":
+            reqs, cursor = build_heading_block(
+                block["runs"], block["level"], cursor, tab_id
+            )
+            pending.extend(reqs)
+        elif btype == "paragraph":
+            reqs, cursor = build_paragraph_block(block["runs"], cursor, tab_id)
+            pending.extend(reqs)
+        elif btype == "list":
+            reqs, cursor = build_list_block(block["items_runs"], cursor, tab_id)
+            pending.extend(reqs)
+        elif btype == "quote":
+            reqs, cursor = build_quote_block(block["runs"], cursor, tab_id)
+            pending.extend(reqs)
+        elif btype == "hr":
+            # Skip horizontal rules -- heading/paragraph separation is enough.
+            continue
+        elif btype == "table":
+            # Flush text-based requests first so cursor positions stay valid.
+            flush()
+            rows = block["rows"]
+            cells_runs = block["cells_runs"]
+            n_rows = len(rows)
+            n_cols = max(len(r) for r in rows) if rows else 0
+            if n_rows == 0 or n_cols == 0:
+                continue
+            # Normalize row widths
+            rows_norm = [r + [""] * (n_cols - len(r)) for r in rows]
+            cells_runs_norm = [
+                cr + [[]] * (n_cols - len(cr)) for cr in cells_runs
+            ]
+
+            # Insert empty table at cursor.
+            insert_table_loc = {"index": cursor}
+            if tab_id:
+                insert_table_loc["tabId"] = tab_id
+            service.documents().batchUpdate(
+                documentId=file_id,
+                body={"requests": [{"insertTable": {
+                    "location": insert_table_loc,
+                    "rows": n_rows,
+                    "columns": n_cols,
+                }}]},
+            ).execute()
+
+            # Re-read doc to find the new table and its cell indices.
+            doc2 = (
+                service.documents()
+                .get(documentId=file_id, includeTabsContent=True)
+                .execute()
+            )
+            body_content = _get_body_content(doc2, tab_id)
+            target_table = None
+            for el in body_content:
+                if "table" in el and el.get("startIndex", -1) >= cursor:
+                    target_table = el
+                    break
+            if target_table is None:
+                raise RuntimeError("Inserted table not found in document body")
+
+            # Build cell-fill requests in reverse order so earlier indices
+            # remain valid as we insert later content.
+            fill_reqs: List[Dict[str, Any]] = []
+            for r_idx in range(n_rows - 1, -1, -1):
+                row_el = target_table["table"]["tableRows"][r_idx]
+                for c_idx in range(n_cols - 1, -1, -1):
+                    cell = row_el["tableCells"][c_idx]
+                    cell_start = cell["startIndex"]
+                    insert_idx = cell_start + 1
+                    runs = cells_runs_norm[r_idx][c_idx]
+                    plain = "".join(t for t, _ in runs)
+                    if not plain:
+                        continue
+                    loc = {"index": insert_idx}
+                    if tab_id:
+                        loc["tabId"] = tab_id
+                    fill_reqs.append({
+                        "insertText": {"location": loc, "text": plain}
+                    })
+                    # Inline bold/code styling inside the cell
+                    off = insert_idx
+                    for run_text, attrs in runs:
+                        rl = len(run_text)
+                        if attrs.get("bold"):
+                            rng = {"startIndex": off, "endIndex": off + rl}
+                            if tab_id:
+                                rng["tabId"] = tab_id
+                            fill_reqs.append({"updateTextStyle": {
+                                "range": rng,
+                                "textStyle": {"bold": True},
+                                "fields": "bold",
+                            }})
+                        if attrs.get("code"):
+                            rng = {"startIndex": off, "endIndex": off + rl}
+                            if tab_id:
+                                rng["tabId"] = tab_id
+                            fill_reqs.append({"updateTextStyle": {
+                                "range": rng,
+                                "textStyle": {
+                                    "weightedFontFamily": {"fontFamily": "Roboto Mono"}
+                                },
+                                "fields": "weightedFontFamily",
+                            }})
+                        off += rl
+
+            for i in range(0, len(fill_reqs), CHUNK):
+                service.documents().batchUpdate(
+                    documentId=file_id,
+                    body={"requests": fill_reqs[i:i + CHUNK]},
+                ).execute()
+
+            # Bold the header row. Re-read to get fresh cell positions.
+            doc3 = (
+                service.documents()
+                .get(documentId=file_id, includeTabsContent=True)
+                .execute()
+            )
+            body_content3 = _get_body_content(doc3, tab_id)
+            target_table3 = None
+            for el in body_content3:
+                if "table" in el and el.get("startIndex", -1) >= cursor:
+                    target_table3 = el
+                    break
+            if target_table3 is not None:
+                header_row = target_table3["table"]["tableRows"][0]
+                hdr_reqs: List[Dict[str, Any]] = []
+                for c_idx in range(n_cols):
+                    cell = header_row["tableCells"][c_idx]
+                    cs = cell["startIndex"]
+                    ce = cell["endIndex"]
+                    if ce - cs > 1:
+                        rng = {"startIndex": cs + 1, "endIndex": ce - 1}
+                        if tab_id:
+                            rng["tabId"] = tab_id
+                        hdr_reqs.append({"updateTextStyle": {
+                            "range": rng,
+                            "textStyle": {"bold": True},
+                            "fields": "bold",
+                        }})
+                if hdr_reqs:
+                    service.documents().batchUpdate(
+                        documentId=file_id, body={"requests": hdr_reqs}
+                    ).execute()
+                # After a table, continue inserting at the start of the
+                # paragraph immediately following the table.
+                cursor = target_table3["endIndex"]
+
+    flush()
+
+    return json.dumps({
+        "inserted": True,
+        "file_id": file_id,
+        "tab_id": tab_id,
+        "replaced": replace,
+        "start_index": start_index if not replace else 1,
+        **counts,
+    }, indent=2)

@@ -41,7 +41,7 @@ class BatchOperationManager:
         self.service = service
 
     def execute_batch_operations(
-        self, document_id: str, operations: list[dict[str, Any]]
+        self, document_id: str, operations: list[dict[str, Any]], tab_id: str = None
     ) -> tuple[bool, str, dict[str, Any]]:
         """
         Execute multiple document operations in a single atomic batch.
@@ -73,6 +73,11 @@ class BatchOperationManager:
 
             if not requests:
                 return False, "No valid requests could be built from operations", {}
+
+            # Inject tab_id into every request if targeting a specific tab
+            if tab_id:
+                from gw.services.docs import _apply_tab_id
+                _apply_tab_id(requests, tab_id)
 
             # Execute the batch
             result = self._execute_batch_requests(document_id, requests)
