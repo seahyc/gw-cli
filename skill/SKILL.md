@@ -125,6 +125,9 @@ gw docs update-document-style <file_id> [margin/page/font flags]
 gw docs manage-named-range <file_id> --action create|delete --name NAME [--start N --end N]
 gw docs manage-table <file_id> --action ACTION --table-index N [flags]
 gw docs debug-table <file_id> --table-index N
+gw docs list-tables <file_id> [--tab-id ID]
+gw docs set-table-column-widths <file_id> --table-index N --widths "W1,W2,..." [--unit PT] [--tab-id ID]
+gw docs table-wrap-estimate <file_id> --table-index N [--widths "W1,W2,..."] [--font-size PT] [--tab-id ID]
 gw docs batch-update <file_id> --requests JSON [--tab-id ID]
 gw docs header-footer <file_id> --action get|create|delete [--type header|footer] [--content TEXT]
 gw docs export-pdf <file_id> [--output PATH] [--folder-id ID]
@@ -189,6 +192,41 @@ tables (first row bolded), `**bold**`, `` `code` `` (Roboto Mono). Horizontal
 rules (`---`) are intentionally skipped — heading/paragraph spacing is
 sufficient. Not supported: nested/ordered lists, images, links, fenced code
 blocks, raw HTML.
+
+#### Table column widths: inspect, set, preview wrapping
+
+Three commands make it possible to see, change, and predict how tables lay out
+without rebuilding them.
+
+```bash
+# Inspect every table in a tab: per-column widths, widthType (FIXED/EVEN),
+# total table width vs inner page width, first-row preview, and the longest
+# cell in each column (useful to judge whether a column is too narrow).
+gw docs list-tables <file_id> --tab-id <tab_id>
+
+# Set fixed widths column-by-column (comma-separated, PT by default).
+# Width count must match the table's column count. Uses the underlying
+# updateTableColumnProperties request so nothing else in the table is rebuilt.
+gw docs set-table-column-widths <file_id> --table-index 1 --tab-id <tab_id> \
+    --widths "30,45,105,145,145"
+
+# Predict wrapping. Without --widths: evaluate the table's current widths.
+# With --widths: evaluate a proposed layout before committing it. Returns
+# per-row max_lines_in_row, per_col_lines, and a summary with
+# total_wrap_penalty plus a rough recommended_widths_pt hint.
+gw docs table-wrap-estimate <file_id> --table-index 1 --tab-id <tab_id>
+gw docs table-wrap-estimate <file_id> --table-index 1 --tab-id <tab_id> \
+    --widths "30,45,105,145,145"
+```
+
+Notes:
+- Widths are treated as `FIXED_WIDTH` at unit `PT` (override with `--unit`).
+- Wrap estimation assumes Roboto 11pt by default; pass `--font-size` (e.g. 10)
+  to match a smaller body font. The heuristic uses an average glyph width, so
+  it's a best-effort predictor, not pixel-perfect.
+- The default tab's layout numbers come from `documentStyle` inside that tab
+  (Google Docs nests page size and margins under `documentTab.documentStyle`
+  when `includeTabsContent=True`).
 
 #### Anchored comments on Docs
 

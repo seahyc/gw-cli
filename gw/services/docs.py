@@ -2029,3 +2029,480 @@ def insert_markdown(
         "start_index": start_index if not replace else 1,
         **counts,
     }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Table column-width inspection & adjustment
+# ---------------------------------------------------------------------------
+
+# Rough per-character width at common body font sizes (in points).
+# Roboto/Arial are both approximately the same here. These numbers are
+# lower-bound-friendly averages that include spaces and moderate letter mix.
+_CHAR_WIDTH_BY_SIZE = {
+    9: 4.6,
+    10: 5.2,
+    10.5: 5.4,
+    11: 5.7,
+    12: 6.2,
+    13: 6.7,
+    14: 7.2,
+}
+
+
+def _char_width_pt(font_size_pt: float) -> float:
+    """Approximate average character width in points for a given font size."""
+    # Clamp to the table; interpolate linearly for values in between keys.
+    sizes = sorted(_CHAR_WIDTH_BY_SIZE.keys())
+    if font_size_pt <= sizes[0]:
+        return _CHAR_WIDTH_BY_SIZE[sizes[0]]
+    if font_size_pt >= sizes[-1]:
+        # Extrapolate by ratio for large sizes.
+        return _CHAR_WIDTH_BY_SIZE[sizes[-1]] * (font_size_pt / sizes[-1])
+    for i in range(len(sizes) - 1):
+        low, high = sizes[i], sizes[i + 1]
+        if low <= font_size_pt <= high:
+            frac = (font_size_pt - low) / (high - low)
+            return _CHAR_WIDTH_BY_SIZE[low] + frac * (
+                _CHAR_WIDTH_BY_SIZE[high] - _CHAR_WIDTH_BY_SIZE[low]
+            )
+    return _CHAR_WIDTH_BY_SIZE[11]
+
+
+def _fetch_doc_with_tabs(service, file_id):
+    """Fetch a document with tabs content (needed for per-tab documentStyle)."""
+    return (
+        service.documents()
+        .get(documentId=file_id, includeTabsContent=True)
+        .execute()
+    )
+
+
+def _document_style_for_tab(doc, tab_id):
+    """Return the documentStyle dict for the given tab_id, falling back to the
+    first top-level tab if tab_id is None, and finally to the doc-level style.
+    """
+    if tab_id:
+        tab = _find_target_tab(doc, tab_id)
+        if tab is not None:
+            ds = tab.get("documentTab", {}).get("documentStyle")
+            if ds:
+                return ds
+    # Fall back to first top-level tab's style when it's present.
+    tabs = doc.get("tabs", []) or []
+    if tabs:
+        ds = tabs[0].get("documentTab", {}).get("documentStyle")
+        if ds:
+            return ds
+    return doc.get("documentStyle", {}) or {}
+
+
+def _inner_page_width_pt(doc_style):
+    """Usable inner page width (page width minus left/right margins), in pt.
+
+    Returns None if the document doesn't expose pageSize/margins (common in
+    new docs that rely on template defaults).
+    """
+    page = doc_style.get("pageSize") or {}
+    width_info = page.get("width") or {}
+    width_pt = width_info.get("magnitude")
+    if width_pt is None:
+        return None
+    left = (doc_style.get("marginLeft") or {}).get("magnitude", 0)
+    right = (doc_style.get("marginRight") or {}).get("magnitude", 0)
+    return float(width_pt) - float(left) - float(right)
+
+
+def _collect_tables_in_body(body_content):
+    """Return a list of table elements from a body content array, in order."""
+    return [el for el in body_content if "table" in el]
+
+
+def _collect_tab_tables(doc, tab_id):
+    """Return (tables, doc_style, tab_title) for the requested tab, or for the
+    default body / first tab when tab_id is None.
+    """
+    if tab_id:
+        tab = _find_target_tab(doc, tab_id)
+        if tab is None:
+            raise ValueError(f"tab_id '{tab_id}' not found in document")
+        props = tab.get("tabProperties", {}) or {}
+        doc_tab = tab.get("documentTab", {}) or {}
+        body_content = doc_tab.get("body", {}).get("content", []) or []
+        doc_style = doc_tab.get("documentStyle", {}) or {}
+        return (
+            _collect_tables_in_body(body_content),
+            doc_style,
+            props.get("title", ""),
+        )
+
+    # No tab_id: prefer top-level body when populated, else first top-level tab.
+    body_content = (doc.get("body", {}) or {}).get("content", []) or []
+    if body_content:
+        return (
+            _collect_tables_in_body(body_content),
+            doc.get("documentStyle", {}) or {},
+            "",
+        )
+    tabs = doc.get("tabs", []) or []
+    if tabs:
+        first = tabs[0]
+        props = first.get("tabProperties", {}) or {}
+        doc_tab = first.get("documentTab", {}) or {}
+        body_content = doc_tab.get("body", {}).get("content", []) or []
+        doc_style = doc_tab.get("documentStyle", {}) or {}
+        return (
+            _collect_tables_in_body(body_content),
+            doc_style,
+            props.get("title", ""),
+        )
+    return [], {}, ""
+
+
+def _cell_text(cell):
+    """Extract plain text from a table cell (joined paragraphs, no trailing newline)."""
+    text_parts = []
+    for element in cell.get("content", []) or []:
+        if "paragraph" in element:
+            for pe in element["paragraph"].get("elements", []) or []:
+                tr = pe.get("textRun")
+                if tr and "content" in tr:
+                    text_parts.append(tr["content"])
+    text = "".join(text_parts)
+    # Drop the trailing newline Google Docs tacks onto cells.
+    return text.rstrip("\n")
+
+
+def _column_widths_for_table(table_el, inner_page_width_pt):
+    """Return a list of per-column dicts: {width_pt, width_type, is_explicit}.
+
+    For EVENLY_DISTRIBUTED columns, we derive an effective width by dividing
+    the inner page width by the column count (best-effort visual estimate).
+    """
+    tbl = table_el["table"]
+    col_props = tbl.get("tableStyle", {}).get("tableColumnProperties", []) or []
+    n_cols = len(tbl.get("tableRows", [{}])[0].get("tableCells", [])) if tbl.get("tableRows") else 0
+
+    out = []
+    # When inner page width is unknown, fall back to a conventional 468pt
+    # (Letter size with 1-inch margins) so wrap estimates still have a
+    # usable reference.
+    effective_page = inner_page_width_pt if inner_page_width_pt else 468.0
+    even_width = effective_page / n_cols if n_cols else 0
+
+    for i in range(n_cols):
+        cp = col_props[i] if i < len(col_props) else {}
+        wt = cp.get("widthType", "EVENLY_DISTRIBUTED")
+        width_obj = cp.get("width") or {}
+        explicit = (wt == "FIXED_WIDTH") and ("magnitude" in width_obj)
+        if explicit:
+            width_pt = float(width_obj.get("magnitude", 0))
+        else:
+            width_pt = float(even_width)
+        out.append({
+            "width_pt": round(width_pt, 2),
+            "width_type": wt,
+            "is_explicit": explicit,
+        })
+    return out
+
+
+def _truncate(text, limit):
+    text = text.replace("\n", " ").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def list_doc_tables(service, file_id: str = "", tab_id: str = None) -> str:
+    """List tables in a Google Doc (or a specific tab) with width layout info."""
+    logger.info(f"[list_doc_tables] Doc={file_id}, tab_id={tab_id}")
+    if not file_id:
+        return "Error: 'file_id' is required."
+
+    doc = _fetch_doc_with_tabs(service, file_id)
+    tables, doc_style, tab_title = _collect_tab_tables(doc, tab_id)
+
+    inner_w = _inner_page_width_pt(doc_style)
+
+    table_entries = []
+    for idx, el in enumerate(tables):
+        tbl = el["table"]
+        rows = tbl.get("tableRows", []) or []
+        n_rows = len(rows)
+        n_cols = len(rows[0].get("tableCells", [])) if rows else 0
+
+        col_widths = _column_widths_for_table(el, inner_w)
+        total_width = round(sum(c["width_pt"] for c in col_widths), 2)
+
+        # First-row preview (plain text per cell, truncated)
+        first_row_preview = []
+        if rows:
+            for cell in rows[0].get("tableCells", []) or []:
+                first_row_preview.append(_truncate(_cell_text(cell), 30))
+
+        # Longest cell per column (chars). Skip header row so these numbers
+        # reflect body content, which is usually where wrapping decisions
+        # matter most. Fall back to all rows if only 1 row exists.
+        longest_per_col = [0] * n_cols
+        longest_sample_per_col = [""] * n_cols
+        scan_rows = rows[1:] if n_rows > 1 else rows
+        for row in scan_rows:
+            for c_idx, cell in enumerate(row.get("tableCells", []) or []):
+                text = _cell_text(cell)
+                if len(text) > longest_per_col[c_idx]:
+                    longest_per_col[c_idx] = len(text)
+                    longest_sample_per_col[c_idx] = _truncate(text, 40)
+
+        table_entries.append({
+            "index": idx,
+            "start_index": el.get("startIndex"),
+            "end_index": el.get("endIndex"),
+            "rows": n_rows,
+            "columns": n_cols,
+            "columns_detail": [
+                {
+                    "col": i,
+                    "width_pt": col_widths[i]["width_pt"],
+                    "width_type": col_widths[i]["width_type"],
+                    "is_explicit": col_widths[i]["is_explicit"],
+                    "longest_cell_chars": longest_per_col[i] if i < len(longest_per_col) else 0,
+                    "longest_cell_sample": longest_sample_per_col[i] if i < len(longest_sample_per_col) else "",
+                }
+                for i in range(n_cols)
+            ],
+            "total_width_pt": total_width,
+            "first_row_preview": first_row_preview,
+        })
+
+    result = {
+        "file_id": file_id,
+        "tab_id": tab_id,
+        "tab_title": tab_title,
+        "inner_page_width_pt": round(inner_w, 2) if inner_w else None,
+        "table_count": len(tables),
+        "tables": table_entries,
+    }
+    return json.dumps(result, indent=2)
+
+
+def set_table_column_widths(
+    service,
+    file_id: str = "",
+    table_index: int = 0,
+    widths: List[float] = None,
+    unit: str = "PT",
+    tab_id: str = None,
+) -> str:
+    """Set fixed-width columns on a specific table by position.
+
+    Args:
+        file_id: document ID
+        table_index: 0-based position of the table within the tab/body
+        widths: list of widths (one per column), in the given unit
+        unit: default PT; passed through to the API as-is
+        tab_id: target tab (optional)
+    """
+    logger.info(
+        f"[set_table_column_widths] Doc={file_id}, table_index={table_index}, "
+        f"widths={widths}, unit={unit}, tab_id={tab_id}"
+    )
+    if not file_id:
+        return "Error: 'file_id' is required."
+    if not widths:
+        return "Error: 'widths' (list of per-column widths) is required."
+
+    doc = _fetch_doc_with_tabs(service, file_id)
+    tables, _doc_style, _tab_title = _collect_tab_tables(doc, tab_id)
+    if table_index < 0 or table_index >= len(tables):
+        return (
+            f"Error: table_index {table_index} out of range "
+            f"(tab has {len(tables)} table(s))."
+        )
+
+    table_el = tables[table_index]
+    tbl = table_el["table"]
+    rows = tbl.get("tableRows", []) or []
+    n_cols = len(rows[0].get("tableCells", [])) if rows else 0
+
+    if len(widths) != n_cols:
+        return (
+            f"Error: got {len(widths)} widths but table has {n_cols} column(s)."
+        )
+
+    start_index = table_el.get("startIndex")
+    if start_index is None:
+        return "Error: could not determine tableStartLocation index."
+
+    requests = []
+    for col_idx, width_val in enumerate(widths):
+        req = {
+            "updateTableColumnProperties": {
+                "tableStartLocation": {"index": start_index},
+                "columnIndices": [col_idx],
+                "tableColumnProperties": {
+                    "widthType": "FIXED_WIDTH",
+                    "width": {"magnitude": float(width_val), "unit": unit},
+                },
+                "fields": "widthType,width",
+            }
+        }
+        requests.append(req)
+
+    _apply_tab_id(requests, tab_id)
+
+    service.documents().batchUpdate(
+        documentId=file_id, body={"requests": requests}
+    ).execute()
+
+    return json.dumps({
+        "updated": True,
+        "file_id": file_id,
+        "tab_id": tab_id,
+        "table_index": table_index,
+        "table_start_index": start_index,
+        "columns": n_cols,
+        "widths": [float(w) for w in widths],
+        "unit": unit,
+    }, indent=2)
+
+
+def table_wrap_estimate(
+    service,
+    file_id: str = "",
+    table_index: int = 0,
+    widths: List[float] = None,
+    font_size: float = 11.0,
+    tab_id: str = None,
+) -> str:
+    """Predict how many lines each cell of a table will wrap to, given current
+    or proposed column widths.
+
+    Returns a JSON report with per-row max-lines, per-column detail, and a
+    summary total_wrap_penalty (sum of lines above 1 across all cells).
+    """
+    logger.info(
+        f"[table_wrap_estimate] Doc={file_id}, table_index={table_index}, "
+        f"widths={widths}, font_size={font_size}, tab_id={tab_id}"
+    )
+    if not file_id:
+        return "Error: 'file_id' is required."
+
+    doc = _fetch_doc_with_tabs(service, file_id)
+    tables, doc_style, _tab_title = _collect_tab_tables(doc, tab_id)
+    if table_index < 0 or table_index >= len(tables):
+        return (
+            f"Error: table_index {table_index} out of range "
+            f"(tab has {len(tables)} table(s))."
+        )
+
+    table_el = tables[table_index]
+    tbl = table_el["table"]
+    rows = tbl.get("tableRows", []) or []
+    n_cols = len(rows[0].get("tableCells", [])) if rows else 0
+
+    inner_w = _inner_page_width_pt(doc_style)
+    current_widths = _column_widths_for_table(table_el, inner_w)
+
+    if widths is None:
+        active_widths = [c["width_pt"] for c in current_widths]
+        source = "current"
+    else:
+        if len(widths) != n_cols:
+            return (
+                f"Error: got {len(widths)} widths but table has "
+                f"{n_cols} column(s)."
+            )
+        active_widths = [float(w) for w in widths]
+        source = "proposed"
+
+    char_w = _char_width_pt(font_size)
+
+    import math
+
+    def wrap_lines(text, col_width_pt):
+        # Number of lines required to fit `text` in a column of the given width.
+        # Split on explicit newlines; each segment wraps independently.
+        if col_width_pt <= 0:
+            return max(1, len(text) or 1)
+        # Chars-per-line rounded down (conservative). Guard against zero-width.
+        chars_per_line = max(1, int(col_width_pt // char_w))
+        lines = 0
+        segments = text.split("\n") if text else [""]
+        for seg in segments:
+            if not seg:
+                lines += 1
+                continue
+            lines += math.ceil(len(seg) / chars_per_line)
+        return max(1, lines)
+
+    per_row = []
+    total_penalty = 0
+    heavy_rows = 0
+    col_max_lines = [0] * n_cols
+
+    for r_idx, row in enumerate(rows):
+        cells = row.get("tableCells", []) or []
+        per_col_lines = []
+        per_col_chars = []
+        max_lines = 0
+        for c_idx in range(n_cols):
+            text = _cell_text(cells[c_idx]) if c_idx < len(cells) else ""
+            lines = wrap_lines(text, active_widths[c_idx])
+            per_col_lines.append(lines)
+            per_col_chars.append(len(text))
+            if lines > max_lines:
+                max_lines = lines
+            if lines > col_max_lines[c_idx]:
+                col_max_lines[c_idx] = lines
+            total_penalty += max(0, lines - 1)
+        if max_lines >= 4:
+            heavy_rows += 1
+        per_row.append({
+            "row_index": r_idx,
+            "max_lines_in_row": max_lines,
+            "per_col_lines": per_col_lines,
+            "per_col_chars": per_col_chars,
+            "wraps_heavily": max_lines >= 4,
+        })
+
+    # Convenience auto-rebalance: allocate widths proportional to longest cell
+    # per column (skipping header row if present). Only included as a hint.
+    scan_rows = rows[1:] if len(rows) > 1 else rows
+    longest_per_col = [1] * n_cols
+    for row in scan_rows:
+        for c_idx, cell in enumerate(row.get("tableCells", []) or []):
+            lc = len(_cell_text(cell))
+            if lc > longest_per_col[c_idx]:
+                longest_per_col[c_idx] = lc
+    total_chars = sum(longest_per_col) or 1
+    page_budget = inner_w if inner_w else 468.0
+    # Enforce a minimum column width so tiny-char columns don't go to 0.
+    min_col_pt = 24.0
+    raw_allocs = [page_budget * (lc / total_chars) for lc in longest_per_col]
+    # Post-process: clamp minimums, then re-scale the rest to fit the budget.
+    floored = [max(min_col_pt, w) for w in raw_allocs]
+    scale = page_budget / sum(floored) if sum(floored) else 1
+    suggested_widths = [round(w * scale, 1) for w in floored]
+
+    report = {
+        "file_id": file_id,
+        "tab_id": tab_id,
+        "table_index": table_index,
+        "table_start_index": table_el.get("startIndex"),
+        "rows": len(rows),
+        "columns": n_cols,
+        "font_size_pt": font_size,
+        "char_width_pt": round(char_w, 3),
+        "widths_source": source,
+        "widths_pt": [round(w, 2) for w in active_widths],
+        "inner_page_width_pt": round(inner_w, 2) if inner_w else None,
+        "total_widths_pt": round(sum(active_widths), 2),
+        "per_row": per_row,
+        "summary": {
+            "total_wrap_penalty": total_penalty,
+            "heavy_rows": heavy_rows,
+            "max_lines_per_column": col_max_lines,
+            "recommended_widths_pt": suggested_widths,
+        },
+    }
+    return json.dumps(report, indent=2)

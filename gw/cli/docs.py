@@ -353,6 +353,68 @@ def cmd_list_in_folder(args):
         error(str(e))
 
 
+def cmd_list_tables(args):
+    try:
+        service = get_service("docs")
+        result = docs.list_doc_tables(service, args.file_id, tab_id=args.tab_id)
+        success(result)
+    except Exception as e:
+        error(str(e))
+
+
+def _parse_widths(widths_str):
+    """Parse a comma-separated list of widths into floats."""
+    if widths_str is None:
+        return None
+    parts = [p.strip() for p in widths_str.split(",") if p.strip()]
+    return [float(p) for p in parts]
+
+
+def cmd_set_table_column_widths(args):
+    try:
+        service = get_service("docs")
+        try:
+            widths = _parse_widths(args.widths)
+        except ValueError as e:
+            error(f"Invalid --widths value (expected comma-separated numbers): {e}")
+            return
+        if not widths:
+            error("--widths is required (e.g. --widths \"30,45,105,145,145\")")
+            return
+        result = docs.set_table_column_widths(
+            service,
+            args.file_id,
+            table_index=args.table_index,
+            widths=widths,
+            unit=args.unit,
+            tab_id=args.tab_id,
+        )
+        success(result)
+    except Exception as e:
+        error(str(e))
+
+
+def cmd_table_wrap_estimate(args):
+    try:
+        service = get_service("docs")
+        try:
+            widths = _parse_widths(args.widths) if args.widths else None
+        except ValueError as e:
+            error(f"Invalid --widths value (expected comma-separated numbers): {e}")
+            return
+        result = docs.table_wrap_estimate(
+            service,
+            args.file_id,
+            table_index=args.table_index,
+            widths=widths,
+            font_size=args.font_size,
+            tab_id=args.tab_id,
+        )
+        success(result)
+    except Exception as e:
+        error(str(e))
+
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -594,3 +656,45 @@ def register(subparsers):
     p.add_argument("--folder-id", default="root", help="Folder ID (default: root)")
     p.add_argument("--max-results", type=int, default=100, help="Maximum results (default: 100)")
     p.set_defaults(func=cmd_list_in_folder)
+
+    # list-tables
+    p = docs_sub.add_parser(
+        "list-tables",
+        help="List tables in a doc (or tab) with per-column widths, previews, and longest-cell stats",
+    )
+    p.add_argument("file_id", help="Document ID")
+    p.add_argument("--tab-id", help="If set, only list tables in this tab")
+    p.set_defaults(func=cmd_list_tables)
+
+    # set-table-column-widths
+    p = docs_sub.add_parser(
+        "set-table-column-widths",
+        help="Set fixed column widths on a table (widths are comma-separated, default PT)",
+    )
+    p.add_argument("file_id", help="Document ID")
+    p.add_argument("--table-index", type=int, required=True, help="0-based table index within the tab/body")
+    p.add_argument(
+        "--widths", required=True,
+        help='Comma-separated widths, one per column (e.g. "30,45,105,145,145")',
+    )
+    p.add_argument("--unit", default="PT", help="Unit for widths (default: PT)")
+    p.add_argument("--tab-id", help="If set, target table inside this tab")
+    p.set_defaults(func=cmd_set_table_column_widths)
+
+    # table-wrap-estimate
+    p = docs_sub.add_parser(
+        "table-wrap-estimate",
+        help="Predict how many lines each cell will wrap to, given current or proposed column widths",
+    )
+    p.add_argument("file_id", help="Document ID")
+    p.add_argument("--table-index", type=int, required=True, help="0-based table index within the tab/body")
+    p.add_argument(
+        "--widths",
+        help='Optional comma-separated per-column widths to test (e.g. "30,45,105,145,145"). Uses current widths if omitted.',
+    )
+    p.add_argument(
+        "--font-size", type=float, default=11.0,
+        help="Font size in pt used for the wrap-width heuristic (default: 11)",
+    )
+    p.add_argument("--tab-id", help="If set, target table inside this tab")
+    p.set_defaults(func=cmd_table_wrap_estimate)
