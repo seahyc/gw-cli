@@ -952,6 +952,106 @@ def modify_values(
     return text_output
 
 
+def insert_image(
+    sheets_service,
+    drive_service,
+    file_id: str,
+    cell: str,
+    image_path: Optional[str] = None,
+    image_url: Optional[str] = None,
+    mode: int = 1,
+    public: bool = False,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+) -> str:
+    """Place an image into a single cell using the ``=IMAGE()`` formula.
+
+    The Google Sheets API (v4) has NO native image support: there is no
+    over-the-grid image request and no image field on a cell. The only
+    programmatic way to render an image in a sheet is the ``=IMAGE(url, mode)``
+    spreadsheet function, which fetches ``url`` anonymously server-side and
+    therefore requires the image to be reachable at a public URL.
+
+    This helper accepts either a public ``image_url`` directly, or a local
+    ``image_path`` which it uploads to Drive. A Drive-hosted image only renders
+    in ``=IMAGE`` once the file is link-readable, so ``public`` must be set
+    (otherwise the cell shows ``#ERROR!`` until the file is shared).
+
+    mode: 1 = fit to cell (keep ratio), 2 = stretch to cell, 3 = original size,
+          4 = custom size (requires width & height in pixels).
+    """
+    if not image_url and not image_path:
+        raise UserInputError("Provide either image_path (local file) or image_url.")
+    if image_url and image_path:
+        raise UserInputError("Provide only one of image_path or image_url.")
+
+    notes: List[str] = []
+
+    if image_path:
+        import os
+        import mimetypes
+        from googleapiclient.http import MediaFileUpload
+
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Local image not found: {image_path}")
+        mime_type = mimetypes.guess_type(image_path)[0] or "image/png"
+        created = (
+            drive_service.files()
+            .create(
+                body={"name": os.path.basename(image_path)},
+                media_body=MediaFileUpload(image_path, mimetype=mime_type, resumable=True),
+                fields="id, webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        drive_id = created["id"]
+        size_kb = os.path.getsize(image_path) / 1024
+        notes.append(f"Uploaded image to Drive ({size_kb:.0f} KB, id {drive_id}).")
+
+        if public:
+            drive_service.permissions().create(
+                fileId=drive_id,
+                body={"type": "anyone", "role": "reader"},
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+            notes.append("Sharing set to anyone-with-link (reader) so =IMAGE can fetch it.")
+        else:
+            notes.append(
+                "File is PRIVATE: =IMAGE() will show #ERROR! until it is made "
+                "link-readable. Re-run with --public, or share the Drive file "
+                "manually. (=IMAGE fetches the URL anonymously, so a private "
+                "file cannot render.)"
+            )
+        thumb_w = width or 1600
+        image_url = f"https://drive.google.com/thumbnail?id={drive_id}&sz=w{thumb_w}"
+
+    url_escaped = image_url.replace('"', '""')
+    if mode == 4:
+        if not (width and height):
+            raise UserInputError("mode 4 (custom size) requires both width and height in pixels.")
+        formula = f'=IMAGE("{url_escaped}",4,{int(height)},{int(width)})'
+    elif mode in (1, 2, 3):
+        formula = f'=IMAGE("{url_escaped}",{int(mode)})'
+    else:
+        raise UserInputError("mode must be 1, 2, 3, or 4.")
+
+    (
+        sheets_service.spreadsheets()
+        .values()
+        .update(
+            spreadsheetId=file_id,
+            range=cell,
+            valueInputOption="USER_ENTERED",
+            body={"values": [[formula]]},
+        )
+        .execute()
+    )
+    notes.append(f"Set {cell} = {formula}")
+    return "\n".join(notes)
+
+
 def format_range(
     service,
     file_id: str,

@@ -79,6 +79,27 @@ def cmd_write(args):
         error(str(e))
 
 
+def cmd_insert_image(args):
+    try:
+        sheets_service = get_service("sheets")
+        drive_service = get_service("drive")
+        result = sheets.insert_image(
+            sheets_service,
+            drive_service,
+            args.file_id,
+            cell=args.range,
+            image_path=args.image,
+            image_url=args.url,
+            mode=args.mode,
+            public=args.public,
+            width=args.width,
+            height=args.height,
+        )
+        success(result)
+    except Exception as e:
+        error(str(e))
+
+
 def cmd_find_replace(args):
     try:
         service = get_service("sheets")
@@ -583,6 +604,26 @@ def register(subparsers):
                    choices=["USER_ENTERED", "RAW"])
     p.add_argument("--clear", action="store_true")
     p.set_defaults(func=cmd_write)
+
+    # insert-image
+    p = sheets_sub.add_parser(
+        "insert-image",
+        help="Insert an image into a cell via =IMAGE(). Sheets API has no native "
+             "image insert; this uploads to Drive and sets the formula (needs a "
+             "public/link-readable file).",
+    )
+    p.add_argument("file_id")
+    p.add_argument("--range", required=True, help="Target cell, e.g. \"'Tab'!A1\"")
+    p.add_argument("--image", default=None, help="Local image file to upload to Drive")
+    p.add_argument("--url", default=None, help="Public image URL (instead of --image)")
+    p.add_argument("--mode", type=int, default=1, choices=[1, 2, 3, 4],
+                   help="1=fit cell, 2=stretch, 3=original size, 4=custom (needs --width/--height)")
+    p.add_argument("--width", type=int, default=None,
+                   help="px: mode 4 width, and/or Drive thumbnail render width")
+    p.add_argument("--height", type=int, default=None, help="px: mode 4 height")
+    p.add_argument("--public", action="store_true",
+                   help="Make the uploaded Drive file link-readable so =IMAGE can fetch it")
+    p.set_defaults(func=cmd_insert_image)
 
     # find-replace
     p = sheets_sub.add_parser("find-replace", help="Find and replace text")
