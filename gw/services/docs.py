@@ -26,6 +26,7 @@ from gw.services._helpers.docs_structure import (
     parse_document_structure,
     find_tables,
     analyze_document_complexity,
+    extract_images,
 )
 from gw.services._helpers.docs_tables import extract_table_as_data
 from gw.services._helpers.docs_managers import (
@@ -469,15 +470,24 @@ def get_doc_content(drive_service, docs_service, file_id: str = "", tab_id: str 
     return header + body_text
 
 
-def inspect_doc_structure(service, file_id: str = "", detailed: bool = False) -> str:
+def inspect_doc_structure(
+    service,
+    file_id: str = "",
+    detailed: bool = False,
+    images: bool = False,
+) -> str:
     """Analyze document structure to find safe insertion indices and table positions."""
-    logger.debug(f"[inspect_doc_structure] Doc={file_id}, detailed={detailed}")
+    logger.debug(
+        f"[inspect_doc_structure] Doc={file_id}, detailed={detailed}, images={images}"
+    )
 
     doc = (
         service.documents()
         .get(documentId=file_id)
         .execute()
     )
+
+    image_list = extract_images(doc)
 
     if detailed:
         structure = parse_document_structure(doc)
@@ -493,9 +503,13 @@ def inspect_doc_structure(service, file_id: str = "", detailed: bool = False) ->
                 ),
                 "has_headers": bool(structure["headers"]),
                 "has_footers": bool(structure["footers"]),
+                "images": len(image_list),
             },
+            "image_count": len(image_list),
             "elements": [],
         }
+        if images or image_list:
+            result["images"] = image_list
 
         for element in structure["body"]:
             elem_summary = {
@@ -533,6 +547,7 @@ def inspect_doc_structure(service, file_id: str = "", detailed: bool = False) ->
                 )
     else:
         result = analyze_document_complexity(doc)
+        result["image_count"] = len(image_list)
 
         tables = find_tables(doc)
         if tables:
@@ -547,6 +562,9 @@ def inspect_doc_structure(service, file_id: str = "", detailed: bool = False) ->
                         "end_index": table["end_index"],
                     }
                 )
+
+        if images:
+            result["images"] = image_list
 
     return json.dumps(result, indent=2)
 
@@ -775,6 +793,124 @@ def find_and_replace_doc(
     return f"Replaced {replacements} occurrence(s) of '{find_text}' with '{replace_text}'."
 
 
+def _find_text_ranges_in_body(body: dict, find_text: str) -> list:
+    """Return [(startIndex, endIndex), ...] for every occurrence of find_text within a body."""
+    ranges = []
+    content = (body or {}).get("content", []) or []
+    for el in content:
+        para = el.get("paragraph")
+        if not para:
+            continue
+        # Build concatenated text + offset map for this paragraph's text runs.
+        parts = []
+        offsets = []  # list of (text_offset_in_paragraph_buffer, docStartIndex)
+        buf = ""
+        for run in para.get("elements", []) or []:
+            tr = run.get("textRun")
+            if not tr:
+                continue
+            run_text = tr.get("content", "") or ""
+            # startIndex lives on the run-element wrapper, not on textRun itself.
+            start = run.get("startIndex")
+            if start is None:
+                start = tr.get("startIndex")
+            if start is None:
+                continue
+            offsets.append((len(buf), start))
+            buf += run_text
+            parts.append(run_text)
+        if not buf or find_text not in buf:
+            continue
+        # Find all occurrences in buf, map back to doc indices.
+        search_from = 0
+        while True:
+            i = buf.find(find_text, search_from)
+            if i < 0:
+                break
+            # Map buf-offset i to doc index by finding the run it falls in.
+            doc_start = None
+            for buf_off, doc_off in offsets:
+                if buf_off <= i:
+                    doc_start = doc_off + (i - buf_off)
+                else:
+                    break
+            if doc_start is not None:
+                ranges.append((doc_start, doc_start + len(find_text)))
+            search_from = i + max(1, len(find_text))
+    return ranges
+
+
+def _find_text_ranges(doc: dict, find_text: str, tab_id: str = None) -> list:
+    """Find text ranges across a doc, handling both tabbed and non-tabbed documents.
+
+    Returns list of (start, end, tab_id) tuples. tab_id is None for non-tabbed docs.
+    If tab_id is provided, only that tab is searched.
+    """
+    results = []
+    body = doc.get("body")
+    if body:
+        for s, e in _find_text_ranges_in_body(body, find_text):
+            results.append((s, e, None))
+    for tab in doc.get("tabs", []) or []:
+        this_tab_id = (tab.get("tabProperties") or {}).get("tabId")
+        if tab_id and this_tab_id != tab_id:
+            continue
+        doc_tab_body = (tab.get("documentTab") or {}).get("body")
+        for s, e in _find_text_ranges_in_body(doc_tab_body, find_text):
+            results.append((s, e, this_tab_id))
+    return results
+
+
+def add_link(
+    service,
+    file_id: str = "",
+    find_text: str = "",
+    url: str = "",
+    match_all: bool = False,
+    tab_id: str = None,
+) -> str:
+    """Find `find_text` in a Google Doc and apply a hyperlink to it.
+
+    By default links only the first occurrence; pass match_all=True to link every match.
+    """
+    logger.info(
+        f"[add_link] Doc={file_id}, find='{find_text}', url='{url}', match_all={match_all}, tab_id={tab_id}"
+    )
+    if not find_text:
+        return "Error: --find text is required."
+    if not url:
+        return "Error: --url is required."
+
+    doc = service.documents().get(
+        documentId=file_id, includeTabsContent=True
+    ).execute()
+    ranges = _find_text_ranges(doc, find_text, tab_id=tab_id)
+    if not ranges:
+        return f"Error: text not found: '{find_text}'."
+    if not match_all:
+        ranges = ranges[:1]
+
+    requests = []
+    for start, end, found_tab_id in ranges:
+        rng = {"startIndex": start, "endIndex": end}
+        effective_tab = tab_id or found_tab_id
+        if effective_tab:
+            rng["tabId"] = effective_tab
+        requests.append({
+            "updateTextStyle": {
+                "range": rng,
+                "textStyle": {"link": {"url": url}},
+                "fields": "link",
+            }
+        })
+
+    service.documents().batchUpdate(
+        documentId=file_id, body={"requests": requests}
+    ).execute()
+
+    return f"Linked {len(ranges)} occurrence(s) of '{find_text}' to {url}."
+
+
 # ---------------------------------------------------------------------------
 # Insert operations
 # ---------------------------------------------------------------------------
@@ -902,7 +1038,10 @@ def insert_doc_image(
         image_uri = image_source
         source_description = "URL image"
 
-    requests = [create_insert_image_request(index, image_uri, width, height)]
+    # Treat 0 / falsy width/height as "unspecified" so Docs API uses natural size.
+    w = width if width else None
+    h = height if height else None
+    requests = [create_insert_image_request(index, image_uri, w, h)]
     _apply_tab_id(requests, tab_id)
 
     (
@@ -1856,7 +1995,8 @@ def insert_markdown(
     # Step 2: walk blocks. Accumulate text-based requests; flush them whenever
     # we hit a table (tables need an insertTable call followed by a doc re-read
     # to learn cell indices before filling cells).
-    CHUNK = 200
+    # Google's batchUpdate hard cap is 500 requests per call; stay just under.
+    CHUNK = 450
     pending: List[Dict[str, Any]] = []
 
     def flush():

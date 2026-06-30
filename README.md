@@ -73,6 +73,31 @@ gw <service> <action> [args]
 
 All output is JSON.
 
+### Raw Google API passthrough
+
+`gw` also provides a raw API layer for full Google Discovery API coverage. Use
+the native `gw` commands for the curated workflows below, and use `gw api` for
+services or methods that are not implemented natively:
+
+```bash
+# Explicit passthrough
+gw api drive files list --params '{"pageSize": 10}'
+gw api schema drive.files.list
+gw api sheets spreadsheets values get --params '{"spreadsheetId": "...", "range": "Sheet1!A1:D10"}'
+gw api people people get --params '{"resourceName": "people/me", "personFields": "names,emailAddresses"}'
+
+# Transparent passthrough for commands gw does not implement natively
+gw drive files list --params '{"pageSize": 10}'
+gw people people get --params '{"resourceName": "people/me", "personFields": "names,emailAddresses"}'
+```
+
+`gw gws ...` remains available as a compatibility alias, but `gw api ...` is the
+public interface.
+
+If `GOOGLE_WORKSPACE_CLI_CLIENT_ID` / `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET` are
+not set, `gw` maps its existing `GOOGLE_OAUTH_CLIENT_ID` /
+`GOOGLE_OAUTH_CLIENT_SECRET` values for raw API child commands.
+
 ### Services
 
 | Service | Description |

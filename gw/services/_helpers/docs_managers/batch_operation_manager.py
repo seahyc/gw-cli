@@ -193,6 +193,10 @@ class BatchOperationManager:
                 op.get("font_family"),
                 op.get("text_color"),
                 op.get("background_color"),
+                op.get("strikethrough"),
+                op.get("superscript"),
+                op.get("subscript"),
+                op.get("link_url"),
             )
 
             if not request:

@@ -320,6 +320,184 @@ def get_next_paragraph_index(doc_data: dict[str, Any], after_index: int = 0) -> 
     return structure["total_length"] - 1 if structure["total_length"] > 0 else 1
 
 
+def extract_images(doc_data: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Find all embedded images (inline + positioned) in a Google Doc.
+
+    Each returned dict includes:
+        - object_id: the inline/positioned object id
+        - kind: "inline" or "positioned"
+        - paragraph_index: 0-based index of the body paragraph the image is
+          anchored to (None if not anchored to a body paragraph)
+        - anchor_text: first ~40 chars of the paragraph the image is anchored to
+        - preceding_heading: text of the nearest preceding heading paragraph
+          (first ~40 chars), or None
+        - content_uri: imageProperties.contentUri (the fetchable URL), if any
+        - source_uri: imageProperties.sourceUri, if any
+        - width / height: {magnitude, unit} dicts, if size is available
+    """
+    images: list[dict[str, Any]] = []
+
+    inline_objects = doc_data.get("inlineObjects", {}) or {}
+    positioned_objects = doc_data.get("positionedObjects", {}) or {}
+
+    body_content = (doc_data.get("body") or {}).get("content", []) or []
+
+    # Walk body paragraphs once, keeping track of paragraph index and the most
+    # recent heading text so we can give every image a useful anchor.
+    para_index = -1
+    last_heading: Optional[str] = None
+    last_nonempty_text: Optional[str] = None
+    last_nonempty_index: Optional[int] = None
+
+    # Pre-scan: collect every body paragraph's text so we can look ahead to the
+    # next non-empty paragraph after an image (helpful when images sit in their
+    # own paragraph followed by a caption/room label).
+    paragraph_texts: list[str] = []
+    for body_element in body_content:
+        if "paragraph" in body_element:
+            paragraph_texts.append(
+                _extract_paragraph_text(body_element["paragraph"]).strip()
+            )
+
+    def _next_nonempty_after(idx: int) -> Optional[str]:
+        for j in range(idx + 1, len(paragraph_texts)):
+            t = paragraph_texts[j]
+            if t:
+                return t
+        return None
+
+    def _embedded_info(embedded: dict[str, Any]) -> dict[str, Any]:
+        img_props = embedded.get("imageProperties", {}) or {}
+        info: dict[str, Any] = {}
+        if "contentUri" in img_props:
+            info["content_uri"] = img_props["contentUri"]
+        if "sourceUri" in img_props:
+            info["source_uri"] = img_props["sourceUri"]
+        size = embedded.get("size") or {}
+        if "width" in size:
+            info["width"] = size["width"]
+        if "height" in size:
+            info["height"] = size["height"]
+        if "title" in embedded:
+            info["title"] = embedded["title"]
+        if "description" in embedded:
+            info["description"] = embedded["description"]
+        return info
+
+    for body_element in body_content:
+        if "paragraph" not in body_element:
+            continue
+        para_index += 1
+        paragraph = body_element["paragraph"]
+        para_text = _extract_paragraph_text(paragraph)
+        style = (paragraph.get("paragraphStyle") or {}).get("namedStyleType", "")
+        if style.startswith("HEADING") or style == "TITLE":
+            last_heading = para_text.strip()
+
+        anchor_text_full = (para_text or "").strip()
+        anchor_text = anchor_text_full[:40]
+        preceding_heading = (last_heading or "")[:40] if last_heading else None
+
+        # Best-effort "what room is this" hint: prefer the image paragraph's
+        # own text, else the previous non-empty paragraph, else the next one.
+        prev_text = last_nonempty_text
+        next_text = _next_nonempty_after(para_index)
+        nearest_text = (
+            anchor_text_full
+            or prev_text
+            or next_text
+            or ""
+        )
+
+        # Inline images: live inside the paragraph's element runs
+        for run in paragraph.get("elements", []) or []:
+            inline_el = run.get("inlineObjectElement")
+            if not inline_el:
+                continue
+            obj_id = inline_el.get("inlineObjectId")
+            obj = inline_objects.get(obj_id, {}) or {}
+            embedded = (
+                obj.get("inlineObjectProperties", {}) or {}
+            ).get("embeddedObject", {}) or {}
+            entry = {
+                "object_id": obj_id,
+                "kind": "inline",
+                "paragraph_index": para_index,
+                "anchor_text": anchor_text,
+                "preceding_heading": preceding_heading,
+                "prev_paragraph_text": (prev_text or "")[:80] if prev_text else None,
+                "next_paragraph_text": (next_text or "")[:80] if next_text else None,
+                "nearest_text": nearest_text[:80] if nearest_text else None,
+                "start_index": run.get("startIndex"),
+                "end_index": run.get("endIndex"),
+            }
+            entry.update(_embedded_info(embedded))
+            images.append(entry)
+
+        # Positioned images: anchored to the paragraph via positionedObjectIds
+        for pos_id in paragraph.get("positionedObjectIds", []) or []:
+            obj = positioned_objects.get(pos_id, {}) or {}
+            embedded = (
+                obj.get("positionedObjectProperties", {}) or {}
+            ).get("embeddedObject", {}) or {}
+            entry = {
+                "object_id": pos_id,
+                "kind": "positioned",
+                "paragraph_index": para_index,
+                "anchor_text": anchor_text,
+                "preceding_heading": preceding_heading,
+                "prev_paragraph_text": (prev_text or "")[:80] if prev_text else None,
+                "next_paragraph_text": (next_text or "")[:80] if next_text else None,
+                "nearest_text": nearest_text[:80] if nearest_text else None,
+            }
+            entry.update(_embedded_info(embedded))
+            images.append(entry)
+
+        if anchor_text_full:
+            last_nonempty_text = anchor_text_full
+            last_nonempty_index = para_index
+
+    # Catch any images that exist in inlineObjects but weren't referenced by a
+    # body paragraph element (e.g. inside table cells or headers/footers).
+    referenced_ids = {img["object_id"] for img in images if img.get("object_id")}
+    for obj_id, obj in inline_objects.items():
+        if obj_id in referenced_ids:
+            continue
+        embedded = (
+            obj.get("inlineObjectProperties", {}) or {}
+        ).get("embeddedObject", {}) or {}
+        entry = {
+            "object_id": obj_id,
+            "kind": "inline",
+            "paragraph_index": None,
+            "anchor_text": None,
+            "preceding_heading": None,
+            "note": "not referenced from body paragraph (likely in table/header/footer)",
+        }
+        entry.update(_embedded_info(embedded))
+        images.append(entry)
+
+    for obj_id, obj in positioned_objects.items():
+        if obj_id in referenced_ids:
+            continue
+        embedded = (
+            obj.get("positionedObjectProperties", {}) or {}
+        ).get("embeddedObject", {}) or {}
+        entry = {
+            "object_id": obj_id,
+            "kind": "positioned",
+            "paragraph_index": None,
+            "anchor_text": None,
+            "preceding_heading": None,
+            "note": "not anchored to a body paragraph",
+        }
+        entry.update(_embedded_info(embedded))
+        images.append(entry)
+
+    return images
+
+
 def analyze_document_complexity(doc_data: dict[str, Any]) -> dict[str, Any]:
     """
     Analyze document complexity and provide statistics.

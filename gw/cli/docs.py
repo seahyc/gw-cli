@@ -55,7 +55,12 @@ def cmd_delete_tab(args):
 def cmd_inspect(args):
     try:
         service = get_service("docs")
-        result = docs.inspect_doc_structure(service, args.file_id, detailed=args.detailed)
+        result = docs.inspect_doc_structure(
+            service,
+            args.file_id,
+            detailed=args.detailed,
+            images=args.images,
+        )
         success(result)
     except Exception as e:
         error(str(e))
@@ -67,6 +72,19 @@ def cmd_edit(args):
         result = docs.find_and_replace_doc(
             service, args.file_id, args.find, args.replace,
             match_case=args.match_case, tab_id=args.tab_id,
+        )
+        success(result)
+    except Exception as e:
+        error(str(e))
+
+
+def cmd_add_link(args):
+    try:
+        service = get_service("docs")
+        result = docs.add_link(
+            service, args.file_id,
+            find_text=args.find, url=args.url,
+            match_all=args.all, tab_id=args.tab_id,
         )
         success(result)
     except Exception as e:
@@ -342,6 +360,81 @@ def cmd_insert_markdown(args):
         error(str(e))
 
 
+def _read_markdown_source(args, allow_stdin=True):
+    """Resolve --file / --stdin / --content into a markdown string."""
+    if getattr(args, "stdin", False):
+        if not allow_stdin:
+            raise ValueError("--stdin not supported here")
+        import sys as _sys
+        return _sys.stdin.read()
+    if getattr(args, "content", None) is not None:
+        return args.content
+    if getattr(args, "file", None):
+        with open(args.file, "r", encoding="utf-8") as f:
+            return f.read()
+    raise ValueError("One of --file, --stdin, or --content is required.")
+
+
+def cmd_append_markdown(args):
+    """Append markdown to the end of a doc (or after --index if given).
+
+    Unlike insert-markdown, this auto-discovers the end of the body so callers
+    don't have to compute total_length via `docs inspect` first.
+    """
+    try:
+        service = get_service("docs")
+        md_text = _read_markdown_source(args)
+        if args.index is None:
+            # Discover the body-end index in one call.
+            doc = service.documents().get(
+                documentId=args.file_id, includeTabsContent=True
+            ).execute()
+            from gw.services.docs import _get_body_end_index
+            last_end = _get_body_end_index(doc, args.tab_id)
+            # The final newline is at last_end - 1; inserting at last_end - 1
+            # places content before that trailing newline, which is correct.
+            start_index = max(1, last_end - 1)
+        else:
+            start_index = args.index
+        result = docs.insert_markdown(
+            service,
+            args.file_id,
+            markdown_text=md_text,
+            tab_id=args.tab_id,
+            start_index=start_index,
+            replace=False,
+        )
+        success(result)
+    except FileNotFoundError as e:
+        error(f"Markdown file not found: {e}")
+    except ValueError as e:
+        error(str(e))
+    except Exception as e:
+        error(str(e))
+
+
+def cmd_replace_markdown(args):
+    """Clear the doc body (or target tab) and replace it with markdown."""
+    try:
+        service = get_service("docs")
+        md_text = _read_markdown_source(args)
+        result = docs.insert_markdown(
+            service,
+            args.file_id,
+            markdown_text=md_text,
+            tab_id=args.tab_id,
+            start_index=1,
+            replace=True,
+        )
+        success(result)
+    except FileNotFoundError as e:
+        error(f"Markdown file not found: {e}")
+    except ValueError as e:
+        error(str(e))
+    except Exception as e:
+        error(str(e))
+
+
 def cmd_list_in_folder(args):
     try:
         service = get_service("drive")
@@ -453,6 +546,11 @@ def register(subparsers):
     p = docs_sub.add_parser("inspect", help="Inspect document structure")
     p.add_argument("file_id", help="Document ID")
     p.add_argument("--detailed", action="store_true", help="Show detailed element breakdown")
+    p.add_argument(
+        "--images",
+        action="store_true",
+        help="List embedded images (inline + positioned) with paragraph anchors",
+    )
     p.set_defaults(func=cmd_inspect)
 
     # edit (find-and-replace)
@@ -463,6 +561,15 @@ def register(subparsers):
     p.add_argument("--match-case", action="store_true", help="Case-sensitive matching")
     p.add_argument("--tab-id", help="If set, scope the replace to this tab only")
     p.set_defaults(func=cmd_edit)
+
+    # add-link
+    p = docs_sub.add_parser("add-link", help="Find text in a doc and hyperlink it")
+    p.add_argument("file_id", help="Document ID")
+    p.add_argument("--find", required=True, help="Text to find and link")
+    p.add_argument("--url", required=True, help="URL to link to")
+    p.add_argument("--all", action="store_true", help="Link every occurrence (default: only first)")
+    p.add_argument("--tab-id", help="If set, target this tab only")
+    p.set_defaults(func=cmd_add_link)
 
     # insert-text
     p = docs_sub.add_parser("insert-text", help="Insert text at an index")
@@ -650,6 +757,34 @@ def register(subparsers):
         help="Clear all existing content in the target (tab or whole doc) before inserting",
     )
     p.set_defaults(func=cmd_insert_markdown)
+
+    # append-markdown
+    p = docs_sub.add_parser(
+        "append-markdown",
+        help="Append a markdown file/stdin to the end of a doc in one batchUpdate flow",
+    )
+    p.add_argument("file_id", help="Document ID")
+    p.add_argument("--file", help="Path to a local markdown file")
+    p.add_argument("--stdin", action="store_true", help="Read markdown from stdin")
+    p.add_argument("--content", help="Markdown content as a string")
+    p.add_argument("--tab-id", help="If set, append into this tab")
+    p.add_argument(
+        "--index", type=int, default=None,
+        help="Override insertion index. If omitted, auto-discovers end of body.",
+    )
+    p.set_defaults(func=cmd_append_markdown)
+
+    # replace-markdown
+    p = docs_sub.add_parser(
+        "replace-markdown",
+        help="Replace the entire doc body (or tab) with markdown content",
+    )
+    p.add_argument("file_id", help="Document ID")
+    p.add_argument("--file", help="Path to a local markdown file")
+    p.add_argument("--stdin", action="store_true", help="Read markdown from stdin")
+    p.add_argument("--content", help="Markdown content as a string")
+    p.add_argument("--tab-id", help="If set, target this tab instead of the default body")
+    p.set_defaults(func=cmd_replace_markdown)
 
     # list-in-folder
     p = docs_sub.add_parser("list-in-folder", help="List Google Docs in a Drive folder")
