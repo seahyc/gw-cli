@@ -9,7 +9,35 @@ Use the `gw` CLI tool via the Bash tool for all Google Workspace operations. All
 
 Command pattern: `gw <service> <action> [args]`
 
-Services: `auth`, `gmail`, `drive`, `docs`, `sheets`, `calendar`, `forms`, `slides`, `comments`
+Native services: `auth`, `gmail`, `drive`, `docs`, `sheets`, `calendar`, `forms`, `slides`, `comments`
+
+`gw` also has a raw API passthrough layer for full Google Discovery API
+coverage. Use native `gw` commands first when they exist; for anything
+missing, use `gw api`:
+
+```bash
+gw api <service> <resource> [sub-resource] <method> [flags]
+gw api schema <service.resource.method>
+
+# Explicit passthrough examples
+gw api drive files list --params '{"pageSize": 10}'
+gw api schema drive.files.list
+gw api sheets spreadsheets values get --params '{"spreadsheetId": "...", "range": "Sheet1!A1:D10"}'
+gw api people people get --params '{"resourceName": "people/me", "personFields": "names,emailAddresses"}'
+
+# Transparent passthrough also works when native gw has no matching command
+gw drive files list --params '{"pageSize": 10}'
+gw sheets spreadsheets values get --params '{"spreadsheetId": "...", "range": "Sheet1!A1:D10"}'
+gw people people get --params '{"resourceName": "people/me", "personFields": "names,emailAddresses"}'
+```
+
+`gw gws ...` is available as a compatibility alias, but `gw api ...` is the
+public interface.
+
+Passthrough adds coverage for services and methods not implemented natively in
+`gw`, including `people`, `chat`, `classroom`, `keep`, `meet`, `tasks`,
+`script`, `admin-reports`, `events`, `modelarmor`, and deeper resources inside
+Drive, Sheets, Gmail, Calendar, Docs, and Slides.
 
 ## Default approach
 
@@ -17,6 +45,7 @@ Services: `auth`, `gmail`, `drive`, `docs`, `sheets`, `calendar`, `forms`, `slid
 2. Use the appropriate `gw` command for that service.
 3. For writes, confirm the target and intended mutation before executing.
 4. For any command's full usage: `gw <service> <action> --help`
+5. For raw API usage: `gw api <service> ... --help` or `gw api schema <service.resource.method>`
 
 ## Service map
 
@@ -33,6 +62,7 @@ Authentication notes:
 - If a command returns a 401 or `RefreshError`, run `gw auth login` to re-authenticate.
 - `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` env vars must be set for login.
 - After login, subsequent commands work without env vars (credentials embed the client info).
+- If raw API commands return `insufficient authentication scopes` immediately after a successful login, move stale `~/.config/gws/token_cache.json` aside and retry. Do not delete `credentials.enc` unless intentionally re-authenticating.
 
 ### Gmail
 
