@@ -1637,6 +1637,148 @@ def merge_cells(
     return f"{action} cells in {range_name}."
 
 
+# Number format types accepted by the Sheets API NumberFormat.type enum.
+NUMBER_FORMAT_TYPES = {
+    "NUMBER",
+    "PERCENT",
+    "CURRENCY",
+    "DATE",
+    "TIME",
+    "DATE_TIME",
+    "SCIENTIFIC",
+    "TEXT",
+}
+
+
+def set_number_format(
+    service,
+    file_id: str,
+    range_name: str,
+    pattern: str,
+    number_format_type: str = "NUMBER",
+) -> str:
+    """Set the number format (type + pattern) on a range via repeatCell.
+
+    ``pattern`` is a Sheets number-format pattern such as ``#,##0`` (thousands
+    separator), ``0.0%`` (percent), ``"$"#,##0.00`` (currency), or
+    ``yyyy-mm-dd`` (date). ``number_format_type`` is the NumberFormat.type enum.
+    """
+    logger.info(
+        "[set_number_format] Invoked. Spreadsheet: %s, Range: %s, Type: %s, Pattern: %s",
+        file_id,
+        range_name,
+        number_format_type,
+        pattern,
+    )
+
+    normalized_type = (number_format_type or "NUMBER").upper()
+    if normalized_type not in NUMBER_FORMAT_TYPES:
+        raise UserInputError(
+            f"number_format_type must be one of {sorted(NUMBER_FORMAT_TYPES)}."
+        )
+    if not pattern:
+        raise UserInputError("A number-format pattern is required (e.g. '#,##0').")
+
+    metadata = (
+        service.spreadsheets()
+        .get(
+            spreadsheetId=file_id,
+            fields="sheets(properties(sheetId,title))",
+        )
+        .execute()
+    )
+    sheets = metadata.get("sheets", [])
+    grid_range = _parse_a1_range(range_name, sheets)
+
+    number_format = {"type": normalized_type, "pattern": pattern}
+
+    request_body = {
+        "requests": [
+            {
+                "repeatCell": {
+                    "range": grid_range,
+                    "cell": {"userEnteredFormat": {"numberFormat": number_format}},
+                    "fields": "userEnteredFormat.numberFormat",
+                }
+            }
+        ]
+    }
+
+    (
+        service.spreadsheets()
+        .batchUpdate(spreadsheetId=file_id, body=request_body)
+        .execute()
+    )
+
+    return (
+        f"Applied number format {normalized_type} (pattern: {pattern}) to {range_name}."
+    )
+
+
+def apply_banding(
+    service,
+    file_id: str,
+    range_name: str,
+    header_color: Optional[str] = None,
+    first_band_color: Optional[str] = None,
+    second_band_color: Optional[str] = None,
+) -> str:
+    """Apply alternating row colors (banding) to a range via addBanding."""
+    logger.info(
+        "[apply_banding] Invoked. Spreadsheet: %s, Range: %s",
+        file_id,
+        range_name,
+    )
+
+    header_parsed = _parse_hex_color(header_color)
+    first_parsed = _parse_hex_color(first_band_color)
+    second_parsed = _parse_hex_color(second_band_color)
+
+    if not first_parsed and not second_parsed:
+        raise UserInputError(
+            "Provide at least --band-color (and optionally --second-band-color / --header-color)."
+        )
+
+    metadata = (
+        service.spreadsheets()
+        .get(
+            spreadsheetId=file_id,
+            fields="sheets(properties(sheetId,title))",
+        )
+        .execute()
+    )
+    sheets = metadata.get("sheets", [])
+    grid_range = _parse_a1_range(range_name, sheets)
+
+    row_props: Dict[str, Any] = {}
+    if header_parsed:
+        row_props["headerColor"] = header_parsed
+    # Sheets requires firstBandColor + secondBandColor; default the missing one.
+    row_props["firstBandColor"] = first_parsed or second_parsed
+    row_props["secondBandColor"] = second_parsed or first_parsed
+
+    request_body = {
+        "requests": [
+            {
+                "addBanding": {
+                    "bandedRange": {
+                        "range": grid_range,
+                        "rowProperties": row_props,
+                    }
+                }
+            }
+        ]
+    }
+
+    (
+        service.spreadsheets()
+        .batchUpdate(spreadsheetId=file_id, body=request_body)
+        .execute()
+    )
+
+    return f"Applied banding to {range_name}."
+
+
 def insert_dimension(
     service,
     file_id: str,

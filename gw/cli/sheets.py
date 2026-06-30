@@ -145,12 +145,17 @@ def cmd_transform(args):
 def cmd_format(args):
     try:
         service = get_service("sheets")
+        nf_type = args.number_format_type
+        if args.number_format and not nf_type:
+            nf_type = "NUMBER"
         result = sheets.format_range(
             service,
             args.file_id,
             range_name=args.range,
             background_color=args.bg_color,
             text_color=args.text_color,
+            number_format_type=nf_type,
+            number_format_pattern=args.number_format,
             bold=args.bold,
             italic=args.italic,
             font_size=args.font_size,
@@ -158,6 +163,37 @@ def cmd_format(args):
             horizontal_alignment=args.h_align,
             vertical_alignment=args.v_align,
             wrap_strategy=args.wrap,
+        )
+        success(result)
+    except Exception as e:
+        error(str(e))
+
+
+def cmd_number_format(args):
+    try:
+        service = get_service("sheets")
+        result = sheets.set_number_format(
+            service,
+            args.file_id,
+            range_name=args.range,
+            pattern=args.pattern,
+            number_format_type=args.type,
+        )
+        success(result)
+    except Exception as e:
+        error(str(e))
+
+
+def cmd_banding(args):
+    try:
+        service = get_service("sheets")
+        result = sheets.apply_banding(
+            service,
+            args.file_id,
+            range_name=args.range,
+            header_color=args.header_color,
+            first_band_color=args.band_color,
+            second_band_color=args.second_band_color,
         )
         success(result)
     except Exception as e:
@@ -594,7 +630,34 @@ def register(subparsers):
     p.add_argument("--h-align", default=None, choices=["LEFT", "CENTER", "RIGHT"])
     p.add_argument("--v-align", default=None, choices=["TOP", "MIDDLE", "BOTTOM"])
     p.add_argument("--wrap", default=None, choices=["OVERFLOW_CELL", "CLIP", "WRAP"])
+    p.add_argument("--number-format", default=None,
+                   help="Number-format pattern, e.g. '#,##0', '0.0%%', 'yyyy-mm-dd'")
+    p.add_argument("--number-format-type", default=None,
+                   choices=["NUMBER", "PERCENT", "CURRENCY", "DATE", "TIME",
+                            "DATE_TIME", "SCIENTIFIC", "TEXT"],
+                   help="NumberFormat type (default NUMBER when --number-format given)")
     p.set_defaults(func=cmd_format)
+
+    # number-format
+    p = sheets_sub.add_parser("number-format",
+                              help="Set the number format (thousands, percent, currency, date) on a range")
+    p.add_argument("file_id")
+    p.add_argument("--range", required=True)
+    p.add_argument("--pattern", required=True,
+                   help="Number-format pattern, e.g. '#,##0', '0.0%%', '\"$\"#,##0.00', 'yyyy-mm-dd'")
+    p.add_argument("--type", default="NUMBER",
+                   choices=["NUMBER", "PERCENT", "CURRENCY", "DATE", "TIME",
+                            "DATE_TIME", "SCIENTIFIC", "TEXT"])
+    p.set_defaults(func=cmd_number_format)
+
+    # banding
+    p = sheets_sub.add_parser("banding", help="Apply alternating row colors (banding) to a range")
+    p.add_argument("file_id")
+    p.add_argument("--range", required=True)
+    p.add_argument("--header-color", default=None, help="Header row color (#RRGGBB)")
+    p.add_argument("--band-color", default=None, help="First band color (#RRGGBB)")
+    p.add_argument("--second-band-color", default=None, help="Second band color (#RRGGBB)")
+    p.set_defaults(func=cmd_banding)
 
     # borders
     p = sheets_sub.add_parser("borders", help="Apply borders to a range")
