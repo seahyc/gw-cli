@@ -320,9 +320,10 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     p.set_defaults(func=cmd_permissions)
 
     # -- share ----------------------------------------------------------------
-    p = drive_sub.add_parser("share", help="Share a file with a user/group")
+    p = drive_sub.add_parser("share", help="Share a file with a user/group/domain, or anyone-with-link")
     p.add_argument("file_id", help="File ID to share")
-    p.add_argument("--email", required=True, help="Email address to share with")
+    p.add_argument("--email", default=None,
+                   help="Email for type user/group; domain name for type domain. Not needed for type anyone.")
     p.add_argument("--role", default="reader", choices=["reader", "writer", "commenter"], help="Permission role")
     p.add_argument("--type", default="user", choices=["user", "group", "domain", "anyone"], help="Share type")
     p.set_defaults(func=cmd_share)

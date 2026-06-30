@@ -557,13 +557,22 @@ def check_public_access(
 def share_file(
     service,
     file_id: str,
-    email: str,
+    email: Optional[str] = None,
     role: str = "reader",
     share_type: str = "user",
 ) -> str:
-    """Create a permission on a Drive file to share it with a user/group."""
+    """Create a permission on a Drive file.
+
+    ``email`` is required for ``user``/``group`` (the address) and ``domain``
+    (the domain name); it is ignored for ``anyone`` (link-readable share).
+    """
     validate_share_role(role)
     validate_share_type(share_type)
+
+    if share_type in ("user", "group") and not email:
+        raise ValueError(f"--email is required for share type '{share_type}'.")
+    if share_type == "domain" and not email:
+        raise ValueError("--email must be the domain name for share type 'domain'.")
 
     resolved_file_id, file_metadata = resolve_drive_item(
         service, file_id, extra_fields="name",
