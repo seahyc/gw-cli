@@ -11,6 +11,14 @@ import os
 import sys
 import webbrowser
 
+# Google may return a superset of the requested scopes when the account has
+# previously granted this OAuth client extra scopes (e.g. pubsub, cloud-platform
+# from a sibling tool sharing the client_id). oauthlib treats scope!=requested as
+# an error by default; relax it so the token exchange succeeds. The extra scopes
+# are harmless — the credentials still cover everything gw needs.
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
+os.environ.setdefault("OAUTHLIB_IGNORE_SCOPE_CHANGE", "1")
+
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
@@ -247,7 +255,6 @@ def build_manual_auth_url():
     flow.redirect_uri = MANUAL_REDIRECT_URI
     auth_url, _ = flow.authorization_url(
         access_type="offline",
-        include_granted_scopes="true",
         prompt="consent",  # force a refresh_token even on re-consent
     )
     return auth_url, flow
