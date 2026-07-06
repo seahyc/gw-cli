@@ -191,6 +191,24 @@ def _save_credentials(user_email, credentials):
     )
 
 
+def _finalize_credentials(credentials):
+    """Fetch the user's email for freshly-minted credentials and persist them."""
+    service = build("oauth2", "v2", credentials=credentials)
+    user_info = service.userinfo().get().execute()
+    user_email = user_info.get("email", "unknown")
+
+    _save_credentials(user_email, credentials)
+
+    print(f"Authenticated as {user_email}", file=sys.stderr)
+    return credentials, user_email
+
+
+# Loopback redirect used by the manual (headless) flow. Google still fully
+# supports http://localhost redirects; only the old OOB (urn:...:oob) flow was
+# deprecated. Must be listed as an authorized redirect URI on the OAuth client.
+MANUAL_REDIRECT_URI = "http://localhost:8080/"
+
+
 def _run_oauth_flow():
     """Run the OAuth flow to get new credentials."""
     from google_auth_oauthlib.flow import InstalledAppFlow
@@ -210,16 +228,48 @@ def _run_oauth_flow():
                 raise
             continue
 
-    # Get user email
-    service = build("oauth2", "v2", credentials=credentials)
-    user_info = service.userinfo().get().execute()
-    user_email = user_info.get("email", "unknown")
+    return _finalize_credentials(credentials)
 
-    # Save to keychain
-    _save_credentials(user_email, credentials)
 
-    print(f"Authenticated as {user_email}", file=sys.stderr)
-    return credentials, user_email
+def build_manual_auth_url():
+    """Build the consent URL for the headless (paste-URL) flow.
+
+    Returns (auth_url, flow). The caller shows auth_url to the human, who
+    completes consent on ANY device (phone, laptop) and copies the resulting
+    ``http://localhost:8080/?code=...`` URL from the browser's address bar —
+    the loopback page failing to load is expected and harmless; the code in the
+    URL is valid regardless. No browser is needed on this machine.
+    """
+    from google_auth_oauthlib.flow import InstalledAppFlow
+
+    client_config = _get_client_config()
+    flow = InstalledAppFlow.from_client_config(client_config, scopes=ALL_SCOPES)
+    flow.redirect_uri = MANUAL_REDIRECT_URI
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",  # force a refresh_token even on re-consent
+    )
+    return auth_url, flow
+
+
+def exchange_manual_response(flow, redirect_response):
+    """Exchange the pasted redirect URL (or bare code) for credentials + save.
+
+    ``redirect_response`` may be the full ``http://localhost:8080/?code=...``
+    URL copied from the browser, or just the ``code`` value.
+    """
+    redirect_response = (redirect_response or "").strip()
+    if not redirect_response:
+        raise ValueError("empty authorization response")
+
+    if redirect_response.startswith("http://") or redirect_response.startswith("https://"):
+        flow.fetch_token(authorization_response=redirect_response)
+    else:
+        # Bare code pasted — exchange it directly.
+        flow.fetch_token(code=redirect_response)
+
+    return _finalize_credentials(flow.credentials)
 
 
 def get_credentials():
@@ -308,6 +358,28 @@ def auth_status():
 def auth_login():
     """Force re-authentication."""
     credentials, user_email = _run_oauth_flow()
+    return {"authenticated": True, "user": user_email}
+
+
+def auth_login_manual():
+    """Headless re-authentication: print the URL, read the pasted redirect back.
+
+    Designed for machines with no browser (e.g. the headless VM): nothing here
+    calls xdg-open or spins a callback server that the login device must reach.
+    Reads the pasted redirect URL / code from stdin.
+    """
+    auth_url, flow = build_manual_auth_url()
+    print("\nOpen this URL on any device (phone is fine) and approve access:\n", file=sys.stderr)
+    print(auth_url, file=sys.stderr)
+    print(
+        "\nAfter approving, your browser will try to open a http://localhost:8080/?code=... "
+        "page that fails to load — that is expected. Copy that full URL from the address "
+        "bar and paste it below.\n",
+        file=sys.stderr,
+    )
+    print("Paste redirect URL (or just the code): ", end="", file=sys.stderr, flush=True)
+    redirect_response = sys.stdin.readline()
+    credentials, user_email = exchange_manual_response(flow, redirect_response)
     return {"authenticated": True, "user": user_email}
 
 

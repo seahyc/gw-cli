@@ -110,7 +110,15 @@ def main():
     auth_parser = subparsers.add_parser("auth", help="Authentication management")
     auth_sub = auth_parser.add_subparsers(dest="action", required=True)
 
-    auth_sub.add_parser("login", help="Authenticate with Google")
+    login_parser = auth_sub.add_parser("login", help="Authenticate with Google")
+    login_parser.add_argument(
+        "--manual",
+        "--no-browser",
+        dest="manual",
+        action="store_true",
+        help="Headless login: print the consent URL and paste the redirect back "
+        "(no browser needed on this machine)",
+    )
     auth_sub.add_parser("status", help="Show authentication status")
     auth_sub.add_parser("logout", help="Remove stored credentials")
     subparsers.add_parser(
@@ -141,11 +149,14 @@ def main():
 
     # Handle auth commands
     if args.service == "auth":
-        from gw.auth import auth_login, auth_status, auth_logout
+        from gw.auth import auth_login, auth_login_manual, auth_status, auth_logout
         from gw.output import success
 
         if args.action == "login":
-            success(auth_login())
+            if getattr(args, "manual", False):
+                success(auth_login_manual())
+            else:
+                success(auth_login())
         elif args.action == "status":
             success(auth_status())
         elif args.action == "logout":
