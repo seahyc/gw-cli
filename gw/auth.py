@@ -379,7 +379,16 @@ def auth_login_manual():
     )
     print("Paste redirect URL (or just the code): ", end="", file=sys.stderr, flush=True)
     redirect_response = sys.stdin.readline()
-    credentials, user_email = exchange_manual_response(flow, redirect_response)
+    try:
+        credentials, user_email = exchange_manual_response(flow, redirect_response)
+    except Exception as exc:  # noqa: BLE001 — surface a clean message, not a traceback
+        print(
+            f"\nCould not exchange the pasted value for tokens: {exc}\n"
+            "Make sure you copied the FULL http://localhost:8080/?code=... URL from the "
+            "address bar (the code expires quickly — if it's been a while, just re-run).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     return {"authenticated": True, "user": user_email}
 
 
