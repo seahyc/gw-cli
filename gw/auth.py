@@ -119,33 +119,86 @@ def _get_keychain_store():
         sys.exit(1)
 
 
-def _load_credentials():
-    """Load credentials from macOS Keychain."""
-    keyring = _get_keychain_store()
+# Keychain bookkeeping entries (stored under KEYCHAIN_SERVICE alongside the
+# per-email credential entries). `__registered_users__` predates multi-account
+# support; when no explicit default is stored, the first registered user is
+# the default, exactly as before.
+_USERS_KEY = "__registered_users__"
+_DEFAULT_KEY = "__default_user__"
+_ALIASES_KEY = "__account_aliases__"
 
-    # Get list of registered users
-    users_json = keyring.get_password(KEYCHAIN_SERVICE, "__registered_users__")
-    if not users_json:
-        return None, None
+# Account selected for this process via `gw --account X ...` or GW_ACCOUNT.
+_active_account = None
 
+
+class AccountError(RuntimeError):
+    """Raised when a requested account is not registered."""
+
+
+def set_active_account(account):
+    """Select the account (email or alias) used by get_credentials()."""
+    global _active_account
+    _active_account = account or None
+
+
+def _read_json_entry(keyring, key, fallback):
+    raw = keyring.get_password(KEYCHAIN_SERVICE, key)
+    if not raw:
+        return fallback
     try:
-        users = json.loads(users_json)
+        value = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
-        return None, None
+        return fallback
+    return value if isinstance(value, type(fallback)) else fallback
 
-    if not users:
-        return None, None
 
-    # Use first registered user
-    user_email = users[0] if isinstance(users, list) else list(users)[0]
-    creds_json = keyring.get_password(KEYCHAIN_SERVICE, user_email)
-    if not creds_json:
-        return None, user_email
+def _registered_users(keyring=None):
+    keyring = keyring or _get_keychain_store()
+    users = _read_json_entry(keyring, _USERS_KEY, [])
+    return list(users)
 
+
+def _aliases(keyring=None):
+    keyring = keyring or _get_keychain_store()
+    return _read_json_entry(keyring, _ALIASES_KEY, {})
+
+
+def _default_user(keyring=None):
+    keyring = keyring or _get_keychain_store()
+    users = _registered_users(keyring)
+    stored = keyring.get_password(KEYCHAIN_SERVICE, _DEFAULT_KEY)
+    if stored and stored in users:
+        return stored
+    return users[0] if users else None
+
+
+def resolve_account(account, keyring=None):
+    """Map an email or alias to a registered email. None -> default account."""
+    keyring = keyring or _get_keychain_store()
+    users = _registered_users(keyring)
+    if not account:
+        return _default_user(keyring)
+    aliases = _aliases(keyring)
+    email = aliases.get(account, account)
+    if email in users:
+        return email
+    lowered = {u.lower(): u for u in users}
+    if email.lower() in lowered:
+        return lowered[email.lower()]
+    raise AccountError(
+        f"account '{account}' is not logged in. Run: gw auth login --account {account}"
+    )
+
+
+def _selected_account_name():
+    return _active_account or os.environ.get("GW_ACCOUNT") or None
+
+
+def _credentials_from_json(creds_json):
     try:
         creds_data = json.loads(creds_json)
     except (json.JSONDecodeError, TypeError):
-        return None, user_email
+        return None
 
     from datetime import datetime
 
@@ -158,7 +211,7 @@ def _load_credentials():
         except (ValueError, TypeError):
             pass
 
-    credentials = Credentials(
+    return Credentials(
         token=creds_data.get("token"),
         refresh_token=creds_data.get("refresh_token"),
         token_uri=creds_data.get("token_uri"),
@@ -168,7 +221,22 @@ def _load_credentials():
         expiry=expiry,
     )
 
-    return credentials, user_email
+
+def _load_credentials(account=None):
+    """Load credentials from macOS Keychain for `account` (email or alias).
+
+    With no account, uses the process-selected account (--account/GW_ACCOUNT)
+    or else the stored default (first registered user if none was chosen).
+    """
+    keyring = _get_keychain_store()
+    user_email = resolve_account(account or _selected_account_name(), keyring)
+    if not user_email:
+        return None, None
+
+    creds_json = keyring.get_password(KEYCHAIN_SERVICE, user_email)
+    if not creds_json:
+        return None, user_email
+    return _credentials_from_json(creds_json), user_email
 
 
 def _save_credentials(user_email, credentials):
@@ -187,25 +255,41 @@ def _save_credentials(user_email, credentials):
 
     keyring.set_password(KEYCHAIN_SERVICE, user_email, json.dumps(creds_data))
 
-    # Update users list
-    users_json = keyring.get_password(KEYCHAIN_SERVICE, "__registered_users__")
-    try:
-        users = set(json.loads(users_json)) if users_json else set()
-    except (json.JSONDecodeError, TypeError):
-        users = set()
-    users.add(user_email)
-    keyring.set_password(
-        KEYCHAIN_SERVICE, "__registered_users__", json.dumps(sorted(users))
-    )
+    # Update users list. Keep the existing order so the first registered
+    # user stays the implicit default for installs that never ran `auth use`.
+    users = _registered_users(keyring)
+    if user_email not in users:
+        users.append(user_email)
+    keyring.set_password(KEYCHAIN_SERVICE, _USERS_KEY, json.dumps(users))
 
 
-def _finalize_credentials(credentials):
+def _record_login_target(user_email, requested):
+    """After a login for `requested` (email or alias), remember the alias and
+    make sure a mismatched email is reported instead of silently accepted."""
+    if not requested:
+        return
+    keyring = _get_keychain_store()
+    if "@" in requested:
+        if requested.lower() != user_email.lower():
+            print(
+                f"Warning: asked to log in as {requested} but Google returned "
+                f"{user_email}; stored credentials under {user_email}.",
+                file=sys.stderr,
+            )
+        return
+    aliases = _aliases(keyring)
+    aliases[requested] = user_email
+    keyring.set_password(KEYCHAIN_SERVICE, _ALIASES_KEY, json.dumps(aliases, sort_keys=True))
+
+
+def _finalize_credentials(credentials, requested_account=None):
     """Fetch the user's email for freshly-minted credentials and persist them."""
     service = build("oauth2", "v2", credentials=credentials)
     user_info = service.userinfo().get().execute()
     user_email = user_info.get("email", "unknown")
 
     _save_credentials(user_email, credentials)
+    _record_login_target(user_email, requested_account)
 
     print(f"Authenticated as {user_email}", file=sys.stderr)
     return credentials, user_email
@@ -217,7 +301,14 @@ def _finalize_credentials(credentials):
 MANUAL_REDIRECT_URI = "http://localhost:8080/"
 
 
-def _run_oauth_flow():
+def _login_hint_kwargs(account):
+    """Pre-select the Google account on the consent screen when we know it."""
+    if account and "@" in account:
+        return {"login_hint": account}
+    return {}
+
+
+def _run_oauth_flow(account=None):
     """Run the OAuth flow to get new credentials."""
     from google_auth_oauthlib.flow import InstalledAppFlow
 
@@ -229,17 +320,19 @@ def _run_oauth_flow():
     # Try ports in sequence to avoid conflicts
     for port in [8080, 8090, 9090, 0]:
         try:
-            credentials = flow.run_local_server(port=port, open_browser=True)
+            credentials = flow.run_local_server(
+                port=port, open_browser=True, **_login_hint_kwargs(account)
+            )
             break
         except OSError:
             if port == 0:
                 raise
             continue
 
-    return _finalize_credentials(credentials)
+    return _finalize_credentials(credentials, requested_account=account)
 
 
-def build_manual_auth_url():
+def build_manual_auth_url(account=None):
     """Build the consent URL for the headless (paste-URL) flow.
 
     Returns (auth_url, flow). The caller shows auth_url to the human, who
@@ -256,11 +349,12 @@ def build_manual_auth_url():
     auth_url, _ = flow.authorization_url(
         access_type="offline",
         prompt="consent",  # force a refresh_token even on re-consent
+        **_login_hint_kwargs(account),
     )
     return auth_url, flow
 
 
-def exchange_manual_response(flow, redirect_response):
+def exchange_manual_response(flow, redirect_response, account=None):
     """Exchange the pasted redirect URL (or bare code) for credentials + save.
 
     ``redirect_response`` may be the full ``http://localhost:8080/?code=...``
@@ -276,11 +370,12 @@ def exchange_manual_response(flow, redirect_response):
         # Bare code pasted — exchange it directly.
         flow.fetch_token(code=redirect_response)
 
-    return _finalize_credentials(flow.credentials)
+    return _finalize_credentials(flow.credentials, requested_account=account)
 
 
 def get_credentials():
-    """Get valid credentials, running OAuth flow if needed."""
+    """Get valid credentials for the selected account, running OAuth if needed."""
+    requested = _selected_account_name()
     credentials, user_email = _load_credentials()
 
     if credentials and credentials.valid:
@@ -295,7 +390,15 @@ def get_credentials():
         except RefreshError:
             print("Token expired, re-authenticating...", file=sys.stderr)
 
-    return _run_oauth_flow()
+    return _run_oauth_flow(account=user_email or requested)
+
+
+def current_account():
+    """Email of the account whose credentials this process uses (no OAuth)."""
+    try:
+        return resolve_account(_selected_account_name())
+    except AccountError:
+        return None
 
 
 def get_service(service_name, version=None):
@@ -333,6 +436,16 @@ def get_services(*service_names):
     )
 
 
+def _credential_state(credentials):
+    if not credentials:
+        return "missing"
+    if credentials.valid:
+        return "valid"
+    if credentials.expired and credentials.refresh_token:
+        return "refreshable"
+    return "invalid"
+
+
 def auth_status():
     """Print current authentication status."""
     credentials, user_email = _load_credentials()
@@ -344,6 +457,7 @@ def auth_status():
         return {
             "authenticated": True,
             "user": user_email,
+            "account": user_email,
             "scopes": list(credentials.scopes) if credentials.scopes else [],
         }
 
@@ -351,6 +465,7 @@ def auth_status():
         return {
             "authenticated": True,
             "user": user_email,
+            "account": user_email,
             "token_expired": True,
             "message": "Token expired but can be refreshed automatically",
         }
@@ -358,24 +473,69 @@ def auth_status():
     return {
         "authenticated": False,
         "user": user_email,
+        "account": user_email,
         "message": "Credentials invalid. Run: gw auth login",
     }
 
 
-def auth_login():
-    """Force re-authentication."""
-    credentials, user_email = _run_oauth_flow()
-    return {"authenticated": True, "user": user_email}
+def auth_list():
+    """List every stored account with its aliases and token state (no secrets)."""
+    keyring = _get_keychain_store()
+    users = _registered_users(keyring)
+    default = _default_user(keyring)
+    aliases = _aliases(keyring)
+    selected = None
+    try:
+        selected = resolve_account(_selected_account_name(), keyring)
+    except AccountError:
+        pass
+    accounts = []
+    for email in users:
+        raw = keyring.get_password(KEYCHAIN_SERVICE, email)
+        creds = _credentials_from_json(raw) if raw else None
+        accounts.append({
+            "email": email,
+            "aliases": sorted(a for a, e in aliases.items() if e == email),
+            "default": email == default,
+            "selected": email == selected,
+            "credential_state": _credential_state(creds),
+        })
+    return {
+        "accounts": accounts,
+        "default": default,
+        "selected": selected,
+        "summary": (
+            f"{len(accounts)} account(s); default {default or 'none'}"
+            if accounts else "No accounts. Run: gw auth login"
+        ),
+    }
 
 
-def auth_login_manual():
+def auth_use(account):
+    """Make `account` (email or alias) the default for future commands."""
+    keyring = _get_keychain_store()
+    email = resolve_account(account, keyring)
+    if not email:
+        raise AccountError("no accounts are logged in. Run: gw auth login")
+    keyring.set_password(KEYCHAIN_SERVICE, _DEFAULT_KEY, email)
+    return {"default": email, "summary": f"Default account is now {email}"}
+
+
+def auth_login(account=None):
+    """Force re-authentication (optionally for a specific account or alias)."""
+    credentials, user_email = _run_oauth_flow(account=account or _selected_account_name())
+    return {"authenticated": True, "user": user_email, "account": user_email}
+
+
+def auth_login_manual(account=None):
     """Headless re-authentication: print the URL, read the pasted redirect back.
 
     Designed for machines with no browser (e.g. the headless VM): nothing here
     calls xdg-open or spins a callback server that the login device must reach.
     Reads the pasted redirect URL / code from stdin.
     """
-    auth_url, flow = build_manual_auth_url()
+    account = account or _selected_account_name()
+    auth_url, flow = build_manual_auth_url(account)
     print("\nOpen this URL on any device (phone is fine) and approve access:\n", file=sys.stderr)
     print(auth_url, file=sys.stderr)
     print(
@@ -387,7 +547,9 @@ def auth_login_manual():
     print("Paste redirect URL (or just the code): ", end="", file=sys.stderr, flush=True)
     redirect_response = sys.stdin.readline()
     try:
-        credentials, user_email = exchange_manual_response(flow, redirect_response)
+        credentials, user_email = exchange_manual_response(
+            flow, redirect_response, account=account
+        )
     except Exception as exc:  # noqa: BLE001 — surface a clean message, not a traceback
         print(
             f"\nCould not exchange the pasted value for tokens: {exc}\n"
@@ -396,24 +558,39 @@ def auth_login_manual():
             file=sys.stderr,
         )
         sys.exit(1)
-    return {"authenticated": True, "user": user_email}
+    return {"authenticated": True, "user": user_email, "account": user_email}
 
 
-def auth_logout():
-    """Remove stored credentials."""
+def auth_logout(account=None):
+    """Remove stored credentials: one account when given, otherwise all."""
     keyring = _get_keychain_store()
 
-    users_json = keyring.get_password(KEYCHAIN_SERVICE, "__registered_users__")
-    if users_json:
+    if account:
+        email = resolve_account(account, keyring)
         try:
-            users = json.loads(users_json)
-            for user in users:
-                try:
-                    keyring.delete_password(KEYCHAIN_SERVICE, user)
-                except Exception:
-                    pass
-            keyring.delete_password(KEYCHAIN_SERVICE, "__registered_users__")
-        except (json.JSONDecodeError, TypeError):
+            keyring.delete_password(KEYCHAIN_SERVICE, email)
+        except Exception:
+            pass
+        users = [u for u in _registered_users(keyring) if u != email]
+        keyring.set_password(KEYCHAIN_SERVICE, _USERS_KEY, json.dumps(users))
+        aliases = {a: e for a, e in _aliases(keyring).items() if e != email}
+        keyring.set_password(KEYCHAIN_SERVICE, _ALIASES_KEY, json.dumps(aliases, sort_keys=True))
+        if keyring.get_password(KEYCHAIN_SERVICE, _DEFAULT_KEY) == email:
+            try:
+                keyring.delete_password(KEYCHAIN_SERVICE, _DEFAULT_KEY)
+            except Exception:
+                pass
+        return {"message": f"Logged out {email}", "account": email}
+
+    for user in _registered_users(keyring):
+        try:
+            keyring.delete_password(KEYCHAIN_SERVICE, user)
+        except Exception:
+            pass
+    for key in (_USERS_KEY, _DEFAULT_KEY, _ALIASES_KEY):
+        try:
+            keyring.delete_password(KEYCHAIN_SERVICE, key)
+        except Exception:
             pass
 
     return {"message": "Logged out successfully"}
