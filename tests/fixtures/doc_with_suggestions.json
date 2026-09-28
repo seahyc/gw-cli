@@ -1,0 +1,64 @@
+{
+  "documentId": "fixture-doc",
+  "title": "Fixture",
+  "revisionId": "rev-1",
+  "lists": {
+    "kix.list1": {"listProperties": {"nestingLevels": [{"glyphSymbol": "●"}]}}
+  },
+  "body": {
+    "content": [
+      {"startIndex": 0, "endIndex": 1, "sectionBreak": {}},
+      {
+        "startIndex": 1, "endIndex": 30,
+        "paragraph": {
+          "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+          "elements": [
+            {"startIndex": 1, "endIndex": 11, "textRun": {"content": "Revenue is ", "textStyle": {}}},
+            {"startIndex": 11, "endIndex": 15, "textRun": {"content": "$1M ", "textStyle": {}, "suggestedDeletionIds": ["suggest.a"]}},
+            {"startIndex": 15, "endIndex": 19, "textRun": {"content": "$2M ", "textStyle": {}, "suggestedInsertionIds": ["suggest.a"]}},
+            {"startIndex": 19, "endIndex": 30, "textRun": {"content": "this year.\n", "textStyle": {}}}
+          ]
+        }
+      },
+      {
+        "startIndex": 30, "endIndex": 45,
+        "paragraph": {
+          "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+          "bullet": {"listId": "kix.list1"},
+          "elements": [
+            {"startIndex": 30, "endIndex": 36, "textRun": {"content": "Hire ", "textStyle": {}}},
+            {"startIndex": 36, "endIndex": 45, "textRun": {"content": "two more\n", "textStyle": {}, "suggestedInsertionIds": ["suggest.b"]}}
+          ]
+        }
+      },
+      {
+        "startIndex": 45, "endIndex": 56,
+        "paragraph": {
+          "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+          "elements": [
+            {"startIndex": 45, "endIndex": 56, "textRun": {"content": "Bold me up\n", "textStyle": {}, "suggestedTextStyleChanges": {"suggest.c": {"textStyle": {"bold": true}}}}}
+          ]
+        }
+      },
+      {
+        "startIndex": 56, "endIndex": 80,
+        "table": {
+          "rows": 1, "columns": 2,
+          "tableRows": [
+            {
+              "startIndex": 57, "endIndex": 79,
+              "tableCells": [
+                {"content": [{"startIndex": 58, "endIndex": 63, "paragraph": {"elements": [
+                  {"startIndex": 58, "endIndex": 63, "textRun": {"content": "old\n", "suggestedDeletionIds": ["suggest.d"]}}
+                ]}}]},
+                {"content": [{"startIndex": 63, "endIndex": 68, "paragraph": {"elements": [
+                  {"startIndex": 63, "endIndex": 68, "textRun": {"content": "new\n", "suggestedInsertionIds": ["suggest.d"]}}
+                ]}}]}
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
