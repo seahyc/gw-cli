@@ -136,10 +136,11 @@ gw docs list-tabs <file_id>
 gw docs create-tab <file_id> --title TITLE [--index N] [--parent-tab-id ID]
 gw docs delete-tab <file_id> --tab-id ID
 gw docs inspect <file_id> [--detailed]
+gw docs format-lint <file_id> [--style-resolution effective|explicit|both] [--effective] [--heading-regex REGEX] [--heading-size PT] [--body-size PT] [--table-size PT] [--require-bold-leads] [--tab-id ID]
 gw docs search <query> [--max-results N]
 gw docs list-in-folder [--folder-id ID] [--max-results N]
 gw docs create --title TITLE [--content TEXT]
-gw docs edit <file_id> --find TEXT --replace TEXT [--match-case] [--tab-id ID]
+gw docs edit <file_id> --find TEXT --replace TEXT [--match-case] [--tab-id ID] [--all | --occurrence N] [--dry-run] [--no-verify] [--preserve-style]
 gw docs insert-text <file_id> --text TEXT --index N [--tab-id ID]
 gw docs insert-table <file_id> --rows N --cols N [--index N] [--tab-id ID]
 gw docs create-table <file_id> --data JSON [--index N] [--bold-headers] [--tab-id ID]
@@ -156,7 +157,8 @@ gw docs manage-named-range <file_id> --action create|delete --name NAME [--start
 gw docs manage-table <file_id> --action ACTION --table-index N [flags]
 gw docs debug-table <file_id> --table-index N
 gw docs list-tables <file_id> [--tab-id ID]
-gw docs set-table-column-widths <file_id> --table-index N --widths "W1,W2,..." [--unit PT] [--tab-id ID]
+gw docs table-write <file_id> --table-index N --data JSON [--tab-id ID] [--expected-fingerprint HASH] [--dry-run] [--no-verify] [--bold-headers]
+gw docs set-table-column-widths <file_id> --table-index N --widths "W1,W2,..." [--unit PT] [--tab-id ID] [--expected-fingerprint HASH] [--dry-run]
 gw docs table-wrap-estimate <file_id> --table-index N [--widths "W1,W2,..."] [--font-size PT] [--tab-id ID]
 gw docs batch-update <file_id> --requests JSON [--tab-id ID]
 gw docs header-footer <file_id> --action get|create|delete [--type header|footer] [--content TEXT]
@@ -191,8 +193,16 @@ Typical workflow:
 gw docs read <file_id>
 gw docs inspect <file_id> --detailed
 
-# Find and replace text
-gw docs edit <file_id> --find "old text" --replace "new text"
+# Lint response-doc formatting with inherited styles resolved
+gw docs format-lint <file_id> --effective \
+  --heading-regex '^Q[0-9]+\.' --heading-size 14 \
+  --body-size 11 --table-size 11 --require-bold-leads
+
+# Find and replace text. By default this requires exactly one match; use
+# --all or --occurrence N when multiple matches are intentional. Use --dry-run
+# before edits to shared docs.
+gw docs edit <file_id> --find "old text" --replace "new text" --dry-run
+gw docs edit <file_id> --find "old text" --replace "new text" --occurrence 2
 
 # Insert structured content
 gw docs create-table <file_id> --data '[["Name","Status"],["Alice","Done"]]' --bold-headers
@@ -223,10 +233,12 @@ rules (`---`) are intentionally skipped — heading/paragraph spacing is
 sufficient. Not supported: nested/ordered lists, images, links, fenced code
 blocks, raw HTML.
 
-#### Table column widths: inspect, set, preview wrapping
+#### Tables: inspect, write, set widths, preview wrapping
 
-Three commands make it possible to see, change, and predict how tables lay out
-without rebuilding them.
+Use `list-tables` first. It returns table index, heading context,
+`content_fingerprint`, first-row preview, matrix preview, per-column widths, and
+longest-cell stats. For writes to shared docs, pass the fingerprint into
+mutation commands and run `--dry-run` first.
 
 ```bash
 # Inspect every table in a tab: per-column widths, widthType (FIXED/EVEN),
@@ -234,11 +246,18 @@ without rebuilding them.
 # cell in each column (useful to judge whether a column is too narrow).
 gw docs list-tables <file_id> --tab-id <tab_id>
 
+# Overwrite an existing table with a same-size matrix. The command is
+# revision-safe, can be guarded by table fingerprint, and verifies the final
+# matrix after writing.
+gw docs table-write <file_id> --table-index 1 --tab-id <tab_id> \
+    --expected-fingerprint <hash> --dry-run \
+    --data '[["Metric","Value"],["MAU","1.2M"]]'
+
 # Set fixed widths column-by-column (comma-separated, PT by default).
 # Width count must match the table's column count. Uses the underlying
 # updateTableColumnProperties request so nothing else in the table is rebuilt.
 gw docs set-table-column-widths <file_id> --table-index 1 --tab-id <tab_id> \
-    --widths "30,45,105,145,145"
+    --expected-fingerprint <hash> --dry-run --widths "30,45,105,145,145"
 
 # Predict wrapping. Without --widths: evaluate the table's current widths.
 # With --widths: evaluate a proposed layout before committing it. Returns

@@ -66,12 +66,41 @@ def cmd_inspect(args):
         error(str(e))
 
 
+def cmd_format_lint(args):
+    try:
+        service = get_service("docs")
+        style_resolution = args.style_resolution
+        if args.effective:
+            style_resolution = "effective"
+        result = docs.format_lint_doc(
+            service,
+            args.file_id,
+            tab_id=args.tab_id,
+            style_resolution=style_resolution,
+            heading_regex=args.heading_regex,
+            heading_size=args.heading_size,
+            body_size=args.body_size,
+            table_size=args.table_size,
+            require_bold_leads=args.require_bold_leads,
+            max_issues=args.max_issues,
+        )
+        success(result)
+    except Exception as e:
+        error(str(e))
+
+
 def cmd_edit(args):
     try:
         service = get_service("docs")
         result = docs.find_and_replace_doc(
             service, args.file_id, args.find, args.replace,
-            match_case=args.match_case, tab_id=args.tab_id,
+            match_case=args.match_case,
+            tab_id=args.tab_id,
+            replace_all=args.all,
+            occurrence=args.occurrence,
+            dry_run=args.dry_run,
+            verify=not args.no_verify,
+            preserve_style=args.preserve_style,
         )
         success(result)
     except Exception as e:
@@ -455,6 +484,30 @@ def cmd_list_tables(args):
         error(str(e))
 
 
+def cmd_table_write(args):
+    try:
+        service = get_service("docs")
+        try:
+            table_data = json.loads(args.data)
+        except json.JSONDecodeError as e:
+            error(f"Invalid JSON for --data: {e}")
+            return
+        result = docs.write_table_data(
+            service,
+            args.file_id,
+            table_index=args.table_index,
+            table_data=table_data,
+            tab_id=args.tab_id,
+            expected_fingerprint=args.expected_fingerprint,
+            dry_run=args.dry_run,
+            verify=not args.no_verify,
+            bold_headers=args.bold_headers,
+        )
+        success(result)
+    except Exception as e:
+        error(str(e))
+
+
 def _parse_widths(widths_str):
     """Parse a comma-separated list of widths into floats."""
     if widths_str is None:
@@ -481,6 +534,8 @@ def cmd_set_table_column_widths(args):
             widths=widths,
             unit=args.unit,
             tab_id=args.tab_id,
+            expected_fingerprint=args.expected_fingerprint,
+            dry_run=args.dry_run,
         )
         success(result)
     except Exception as e:
@@ -553,6 +608,52 @@ def register(subparsers):
     )
     p.set_defaults(func=cmd_inspect)
 
+    # format-lint
+    p = docs_sub.add_parser(
+        "format-lint",
+        help="Lint Google Doc formatting, resolving inherited styles by default",
+    )
+    p.add_argument("file_id", help="Document ID")
+    p.add_argument("--tab-id", help="If set, lint only the specified tab")
+    p.add_argument(
+        "--style-resolution",
+        choices=["effective", "explicit", "both"],
+        default="effective",
+        help=(
+            "How to interpret text styles: effective resolves inherited named styles "
+            "(default), explicit checks direct run styles only, both reports both"
+        ),
+    )
+    p.add_argument(
+        "--effective",
+        action="store_true",
+        help="Alias for --style-resolution effective; included for readability",
+    )
+    p.add_argument(
+        "--heading-regex",
+        help="Regex identifying heading/question paragraphs to check",
+    )
+    p.add_argument(
+        "--question-regex",
+        dest="heading_regex",
+        help="Alias for --heading-regex",
+    )
+    p.add_argument("--heading-size", type=float, help="Expected heading font size in pt")
+    p.add_argument("--body-size", type=float, help="Expected non-heading body font size in pt")
+    p.add_argument("--table-size", type=float, help="Expected table text font size in pt")
+    p.add_argument(
+        "--require-bold-leads",
+        action="store_true",
+        help="Require the first answer paragraph after each matched heading to start with a bold substantive lead",
+    )
+    p.add_argument(
+        "--max-issues",
+        type=int,
+        default=50,
+        help="Maximum issues to include in output (default: 50)",
+    )
+    p.set_defaults(func=cmd_format_lint)
+
     # edit (find-and-replace)
     p = docs_sub.add_parser("edit", help="Find and replace text in a doc")
     p.add_argument("file_id", help="Document ID")
@@ -560,6 +661,27 @@ def register(subparsers):
     p.add_argument("--replace", required=True, help="Replacement text")
     p.add_argument("--match-case", action="store_true", help="Case-sensitive matching")
     p.add_argument("--tab-id", help="If set, scope the replace to this tab only")
+    p.add_argument(
+        "--all",
+        action="store_true",
+        help="Replace all matches. Without this or --occurrence, edit requires exactly one match.",
+    )
+    p.add_argument(
+        "--occurrence",
+        type=int,
+        help="Replace only the Nth match, using 1-based document order.",
+    )
+    p.add_argument("--dry-run", action="store_true", help="Preview without writing")
+    p.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="Skip post-write refetch and verification.",
+    )
+    p.add_argument(
+        "--preserve-style",
+        action="store_true",
+        help="Best-effort preserve explicit text style from the matched text.",
+    )
     p.set_defaults(func=cmd_edit)
 
     # add-link
@@ -801,6 +923,28 @@ def register(subparsers):
     p.add_argument("--tab-id", help="If set, only list tables in this tab")
     p.set_defaults(func=cmd_list_tables)
 
+    # table-write
+    p = docs_sub.add_parser(
+        "table-write",
+        help="Overwrite an existing table with an exact-size JSON matrix",
+    )
+    p.add_argument("file_id", help="Document ID")
+    p.add_argument("--table-index", type=int, required=True, help="0-based table index within the tab/body")
+    p.add_argument("--data", required=True, help='JSON matrix, e.g. [["A","B"],["1","2"]]')
+    p.add_argument("--tab-id", help="If set, target table inside this tab")
+    p.add_argument(
+        "--expected-fingerprint",
+        help="Refuse to update unless the current table content fingerprint matches.",
+    )
+    p.add_argument("--dry-run", action="store_true", help="Preview without writing")
+    p.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="Skip post-write refetch and matrix verification.",
+    )
+    p.add_argument("--bold-headers", action="store_true", help="Bold row 0 after writing")
+    p.set_defaults(func=cmd_table_write)
+
     # set-table-column-widths
     p = docs_sub.add_parser(
         "set-table-column-widths",
@@ -814,6 +958,11 @@ def register(subparsers):
     )
     p.add_argument("--unit", default="PT", help="Unit for widths (default: PT)")
     p.add_argument("--tab-id", help="If set, target table inside this tab")
+    p.add_argument(
+        "--expected-fingerprint",
+        help="Refuse to update unless the current table content fingerprint matches.",
+    )
+    p.add_argument("--dry-run", action="store_true", help="Preview without writing")
     p.set_defaults(func=cmd_set_table_column_widths)
 
     # table-wrap-estimate

@@ -8,6 +8,9 @@ Each function accepts pre-authenticated service client(s) and returns a string r
 import io
 import json
 import logging
+import hashlib
+import re
+from collections import Counter
 from typing import List, Dict, Any
 
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
@@ -122,6 +125,71 @@ def _apply_tab_id(requests, tab_id):
     for req in requests:
         _apply_tab_id_to_request(req, tab_id)
     return requests
+
+
+def _revision_id(doc: Dict[str, Any]) -> str:
+    """Return the Docs revision ID when the API includes it."""
+    return doc.get("revisionId", "")
+
+
+def _batch_update_with_revision(
+    service,
+    file_id: str,
+    requests: List[Dict[str, Any]],
+    *,
+    required_revision_id: str = None,
+):
+    """Apply Docs requests, pinning writes to the fetched revision when present."""
+    body = {"requests": requests}
+    if required_revision_id:
+        body["writeControl"] = {"requiredRevisionId": required_revision_id}
+    return (
+        service.documents()
+        .batchUpdate(documentId=file_id, body=body)
+        .execute()
+    )
+
+
+def _fetch_doc_with_tabs(service, file_id):
+    """Fetch a document with tabs content and revision metadata."""
+    return (
+        service.documents()
+        .get(documentId=file_id, includeTabsContent=True)
+        .execute()
+    )
+
+
+def _mutation_result(
+    *,
+    ok: bool,
+    file_id: str,
+    title: str = None,
+    dry_run: bool = False,
+    revision_before: str = None,
+    revision_after: str = None,
+    target: Dict[str, Any] = None,
+    planned_changes: List[Dict[str, Any]] = None,
+    applied_changes: List[Dict[str, Any]] = None,
+    verification: Dict[str, Any] = None,
+    warnings: List[str] = None,
+) -> str:
+    """Standard JSON envelope for mutation commands."""
+    return json.dumps(
+        {
+            "ok": ok,
+            "dry_run": dry_run,
+            "file_id": file_id,
+            "title": title,
+            "revision_before": revision_before,
+            "revision_after": revision_after,
+            "target": target or {},
+            "planned_changes": planned_changes or [],
+            "applied_changes": applied_changes or [],
+            "verification": verification or {},
+            "warnings": warnings or [],
+        },
+        indent=2,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -569,6 +637,471 @@ def inspect_doc_structure(
     return json.dumps(result, indent=2)
 
 
+def _named_style_map(doc: Dict[str, Any], tab_id: str = None) -> Dict[str, Dict[str, Any]]:
+    """Return named style definitions keyed by namedStyleType.
+
+    With includeTabsContent=True, modern Google Docs often places namedStyles
+    under each documentTab instead of the top-level document object.
+    """
+    named_styles = doc.get("namedStyles", {}) or {}
+    if tab_id:
+        tab = _find_target_tab(doc, tab_id)
+        if tab is not None:
+            tab_named_styles = (
+                tab.get("documentTab", {})
+                .get("namedStyles", {})
+                or {}
+            )
+            if tab_named_styles.get("styles"):
+                named_styles = tab_named_styles
+    elif not named_styles.get("styles"):
+        tabs = doc.get("tabs", []) or []
+        if tabs:
+            tab_named_styles = (
+                tabs[0]
+                .get("documentTab", {})
+                .get("namedStyles", {})
+                or {}
+            )
+            if tab_named_styles.get("styles"):
+                named_styles = tab_named_styles
+
+    styles = named_styles.get("styles", []) or []
+    return {s.get("namedStyleType"): s for s in styles if s.get("namedStyleType")}
+
+
+def _effective_text_style(
+    explicit_style: Dict[str, Any],
+    named_style_type: str,
+    named_styles: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Resolve a text run style against its paragraph named style.
+
+    The Docs API omits inherited properties on many text runs. For linting,
+    an omitted direct fontSize should still resolve through NORMAL_TEXT,
+    HEADING_3, etc.; otherwise a visually correct doc appears broken.
+    """
+    named_text_style = (
+        named_styles.get(named_style_type or "NORMAL_TEXT", {})
+        .get("textStyle", {})
+        or {}
+    )
+    normal_text_style = (
+        named_styles.get("NORMAL_TEXT", {})
+        .get("textStyle", {})
+        or {}
+    )
+
+    def pick(field: str):
+        if field in explicit_style:
+            return explicit_style.get(field)
+        if field in named_text_style:
+            return named_text_style.get(field)
+        return normal_text_style.get(field)
+
+    return {
+        "bold": pick("bold"),
+        "italic": pick("italic"),
+        "underline": pick("underline"),
+        "fontSize": pick("fontSize"),
+        "weightedFontFamily": pick("weightedFontFamily"),
+    }
+
+
+def _font_size_magnitude(style: Dict[str, Any]):
+    font_size = style.get("fontSize") or {}
+    return font_size.get("magnitude")
+
+
+def _font_family(style: Dict[str, Any]):
+    family = style.get("weightedFontFamily") or {}
+    return family.get("fontFamily")
+
+
+def _style_snapshot(style: Dict[str, Any]) -> Dict[str, Any]:
+    """Compact a Docs textStyle object for lint output."""
+    return {
+        "font_size": _font_size_magnitude(style),
+        "font_family": _font_family(style),
+        "bold": style.get("bold"),
+        "italic": style.get("italic"),
+        "underline": style.get("underline"),
+    }
+
+
+def _iter_doc_paragraphs(
+    elements: List[Dict[str, Any]],
+    named_styles: Dict[str, Dict[str, Any]],
+    path: str = "body",
+    table_row: int = None,
+    table_col: int = None,
+) -> List[Dict[str, Any]]:
+    """Flatten document body/table paragraphs into lintable records."""
+    paragraphs = []
+    for element in elements or []:
+        if "paragraph" in element:
+            paragraph = element.get("paragraph", {}) or {}
+            paragraph_style = paragraph.get("paragraphStyle", {}) or {}
+            named_style_type = paragraph_style.get("namedStyleType") or "NORMAL_TEXT"
+            text = ""
+            runs = []
+            for pe in paragraph.get("elements", []) or []:
+                text_run = pe.get("textRun")
+                if not text_run:
+                    continue
+                content = text_run.get("content", "")
+                explicit = text_run.get("textStyle", {}) or {}
+                effective = _effective_text_style(
+                    explicit,
+                    named_style_type,
+                    named_styles,
+                )
+                text += content
+                runs.append(
+                    {
+                        "start_index": pe.get("startIndex"),
+                        "end_index": pe.get("endIndex"),
+                        "text": content,
+                        "explicit": _style_snapshot(explicit),
+                        "effective": _style_snapshot(effective),
+                    }
+                )
+            paragraphs.append(
+                {
+                    "start_index": element.get("startIndex"),
+                    "end_index": element.get("endIndex"),
+                    "path": path,
+                    "table_row": table_row,
+                    "table_col": table_col,
+                    "text": text,
+                    "named_style_type": named_style_type,
+                    "runs": runs,
+                }
+            )
+        elif "table" in element:
+            for r_idx, row in enumerate(element["table"].get("tableRows", []) or []):
+                for c_idx, cell in enumerate(row.get("tableCells", []) or []):
+                    paragraphs.extend(
+                        _iter_doc_paragraphs(
+                            cell.get("content", []) or [],
+                            named_styles,
+                            path=f"{path}/table[{r_idx},{c_idx}]",
+                            table_row=r_idx,
+                            table_col=c_idx,
+                        )
+                    )
+        elif "tableOfContents" in element:
+            paragraphs.extend(
+                _iter_doc_paragraphs(
+                    element["tableOfContents"].get("content", []) or [],
+                    named_styles,
+                    path=f"{path}/toc",
+                    table_row=table_row,
+                    table_col=table_col,
+                )
+            )
+    return paragraphs
+
+
+def _style_value_for_run(run: Dict[str, Any], style_resolution: str) -> Dict[str, Any]:
+    if style_resolution == "explicit":
+        return run["explicit"]
+    return run["effective"]
+
+
+def _paragraph_font_sizes(paragraph: Dict[str, Any], style_resolution: str) -> List[float]:
+    sizes = []
+    for run in paragraph.get("runs", []) or []:
+        if not run.get("text", "").strip():
+            continue
+        style = _style_value_for_run(run, style_resolution)
+        sizes.append(style.get("font_size"))
+    return sizes
+
+
+def _paragraph_has_bold_lead(paragraph: Dict[str, Any], style_resolution: str) -> bool:
+    """Return whether the opening substantive run is bold.
+
+    We skip empty runs and short answer prefixes that are usually not the
+    intended lead phrase ("No.", "Yes,", etc.).
+    """
+    text_prefix = ""
+    for run in paragraph.get("runs", []) or []:
+        text = run.get("text", "")
+        if not text:
+            continue
+        stripped = text.strip()
+        if not stripped:
+            continue
+        text_prefix += stripped
+        if len(text_prefix) > 40:
+            break
+
+    skip_prefixes = (
+        "No.",
+        "Yes,",
+        "Yes.",
+        "This is not a data error.",
+    )
+    skip_remaining = any(text_prefix.startswith(prefix) for prefix in skip_prefixes)
+
+    substantive_seen = 0
+    for run in paragraph.get("runs", []) or []:
+        text = run.get("text", "")
+        if not text.strip():
+            continue
+        clean = text.strip()
+        if skip_remaining:
+            matched = False
+            for prefix in skip_prefixes:
+                if clean.startswith(prefix):
+                    matched = True
+                    break
+            if matched:
+                # Continue until the next run, where the actual lead often begins.
+                skip_remaining = False
+                continue
+        substantive_seen += 1
+        style = _style_value_for_run(run, style_resolution)
+        return style.get("bold") is True
+    return False
+
+
+def _add_format_issue(
+    issues: List[Dict[str, Any]],
+    *,
+    check: str,
+    message: str,
+    paragraph: Dict[str, Any],
+    expected=None,
+    actual=None,
+    severity: str = "warning",
+):
+    issues.append(
+        {
+            "severity": severity,
+            "check": check,
+            "message": message,
+            "start_index": paragraph.get("start_index"),
+            "end_index": paragraph.get("end_index"),
+            "path": paragraph.get("path"),
+            "named_style_type": paragraph.get("named_style_type"),
+            "text_preview": paragraph.get("text", "").strip()[:160],
+            "expected": expected,
+            "actual": actual,
+        }
+    )
+
+
+def format_lint_doc(
+    service,
+    file_id: str = "",
+    tab_id: str = None,
+    style_resolution: str = "effective",
+    heading_regex: str = None,
+    heading_size: float = None,
+    body_size: float = None,
+    table_size: float = None,
+    require_bold_leads: bool = False,
+    max_issues: int = 50,
+) -> str:
+    """Lint Google Doc formatting and return JSON.
+
+    style_resolution controls how run styles are evaluated:
+    - effective: resolve inherited named styles (recommended/default)
+    - explicit: only inspect direct run-level formatting
+    - both: report explicit and effective snapshots; lint checks use effective
+    """
+    if style_resolution not in {"effective", "explicit", "both"}:
+        raise ValueError("style_resolution must be one of: effective, explicit, both")
+
+    check_resolution = "effective" if style_resolution == "both" else style_resolution
+    doc = (
+        service.documents()
+        .get(documentId=file_id, includeTabsContent=True)
+        .execute()
+    )
+    named_styles = _named_style_map(doc, tab_id=tab_id)
+    content = _get_body_content(doc, tab_id)
+    paragraphs = _iter_doc_paragraphs(content, named_styles)
+    nonempty = [p for p in paragraphs if p.get("text", "").strip()]
+    heading_pattern = re.compile(heading_regex) if heading_regex else None
+
+    font_size_counter = Counter()
+    explicit_font_size_counter = Counter()
+    style_type_counter = Counter()
+    table_count = 0
+    issues = []
+
+    for paragraph in nonempty:
+        style_type_counter[paragraph["named_style_type"]] += 1
+        if "/table[" in paragraph["path"]:
+            table_count += 1
+        for run in paragraph.get("runs", []) or []:
+            if not run.get("text", "").strip():
+                continue
+            font_size_counter[str(run["effective"].get("font_size"))] += 1
+            explicit_font_size_counter[str(run["explicit"].get("font_size"))] += 1
+
+    headings = []
+    heading_indexes = []
+    if heading_pattern:
+        for idx, paragraph in enumerate(paragraphs):
+            if heading_pattern.search(paragraph.get("text", "").strip()):
+                headings.append(paragraph)
+                heading_indexes.append(idx)
+
+    if heading_size is not None:
+        for paragraph in headings:
+            sizes = _paragraph_font_sizes(paragraph, check_resolution)
+            bad = sorted({s for s in sizes if s != heading_size})
+            if bad:
+                _add_format_issue(
+                    issues,
+                    check="heading_size",
+                    message="Heading paragraph font size does not match expected size.",
+                    paragraph=paragraph,
+                    expected=heading_size,
+                    actual=bad,
+                )
+
+    for idx, paragraph in enumerate(paragraphs):
+        if not paragraph.get("text", "").strip():
+            continue
+        is_heading_match = idx in heading_indexes
+        is_table = "/table[" in paragraph["path"]
+        if body_size is not None and not is_table and not is_heading_match:
+            if paragraph["named_style_type"] in {
+                "HEADING_1",
+                "HEADING_2",
+                "HEADING_3",
+                "HEADING_4",
+                "HEADING_5",
+                "HEADING_6",
+                "TITLE",
+                "SUBTITLE",
+            }:
+                continue
+            sizes = _paragraph_font_sizes(paragraph, check_resolution)
+            bad = sorted({s for s in sizes if s != body_size})
+            if bad:
+                _add_format_issue(
+                    issues,
+                    check="body_size",
+                    message="Body paragraph font size does not match expected size.",
+                    paragraph=paragraph,
+                    expected=body_size,
+                    actual=bad,
+                )
+        if table_size is not None and is_table:
+            sizes = _paragraph_font_sizes(paragraph, check_resolution)
+            bad = sorted({s for s in sizes if s != table_size})
+            if bad:
+                _add_format_issue(
+                    issues,
+                    check="table_size",
+                    message="Table text font size does not match expected size.",
+                    paragraph=paragraph,
+                    expected=table_size,
+                    actual=bad,
+                )
+
+    if require_bold_leads:
+        if not heading_pattern:
+            raise ValueError("--require-bold-leads requires --heading-regex")
+        for pos, heading_idx in enumerate(heading_indexes):
+            next_heading_idx = (
+                heading_indexes[pos + 1]
+                if pos + 1 < len(heading_indexes)
+                else len(paragraphs)
+            )
+            first_answer = None
+            for candidate in paragraphs[heading_idx + 1:next_heading_idx]:
+                if "/table[" in candidate["path"]:
+                    continue
+                if not candidate.get("text", "").strip():
+                    continue
+                if candidate["named_style_type"] in {
+                    "HEADING_1",
+                    "HEADING_2",
+                    "HEADING_3",
+                    "HEADING_4",
+                    "HEADING_5",
+                    "HEADING_6",
+                    "TITLE",
+                    "SUBTITLE",
+                }:
+                    continue
+                first_answer = candidate
+                break
+            if first_answer and not _paragraph_has_bold_lead(
+                first_answer,
+                check_resolution,
+            ):
+                _add_format_issue(
+                    issues,
+                    check="bold_lead",
+                    message="First answer paragraph does not start with a bold substantive lead.",
+                    paragraph=first_answer,
+                    expected=True,
+                    actual=False,
+                )
+
+    truncated = len(issues) > max_issues
+    shown_issues = issues[:max_issues]
+
+    sample_runs = []
+    if style_resolution == "both":
+        for paragraph in nonempty[:20]:
+            for run in paragraph.get("runs", []) or []:
+                if not run.get("text", "").strip():
+                    continue
+                sample_runs.append(
+                    {
+                        "start_index": run.get("start_index"),
+                        "end_index": run.get("end_index"),
+                        "text_preview": run.get("text", "").strip()[:80],
+                        "explicit": run["explicit"],
+                        "effective": run["effective"],
+                    }
+                )
+                if len(sample_runs) >= 20:
+                    break
+            if len(sample_runs) >= 20:
+                break
+
+    result = {
+        "ok": len(issues) == 0,
+        "doc_id": file_id,
+        "title": doc.get("title"),
+        "tab_id": tab_id,
+        "style_resolution": style_resolution,
+        "checks_use": check_resolution,
+        "rules": {
+            "heading_regex": heading_regex,
+            "heading_size": heading_size,
+            "body_size": body_size,
+            "table_size": table_size,
+            "require_bold_leads": require_bold_leads,
+        },
+        "summary": {
+            "paragraphs": len(paragraphs),
+            "nonempty_paragraphs": len(nonempty),
+            "table_cell_paragraphs": table_count,
+            "matched_headings": len(headings),
+            "named_style_counts": dict(style_type_counter),
+            "effective_font_size_counts": dict(font_size_counter),
+            "explicit_font_size_counts": dict(explicit_font_size_counter),
+        },
+        "issue_count": len(issues),
+        "issues_truncated": truncated,
+        "issues": shown_issues,
+    }
+    if sample_runs:
+        result["sample_runs"] = sample_runs
+    return json.dumps(result, indent=2)
+
+
 # ---------------------------------------------------------------------------
 # Create
 # ---------------------------------------------------------------------------
@@ -769,96 +1302,384 @@ def find_and_replace_doc(
     replace_text: str = "",
     match_case: bool = False,
     tab_id: str = None,
+    replace_all: bool = False,
+    occurrence: int = None,
+    dry_run: bool = False,
+    verify: bool = True,
+    preserve_style: bool = False,
 ) -> str:
-    """Find and replace all occurrences of text in a Google Doc."""
-    logger.info(
-        f"[find_and_replace_doc] Doc={file_id}, find='{find_text}', replace='{replace_text}', tab_id={tab_id}"
-    )
+    """Find and replace text in a Google Doc with safe matching by default.
 
-    requests = [create_find_replace_request(find_text, replace_text, match_case)]
-    _apply_tab_id(requests, tab_id)
-
-    result = (
-        service.documents()
-        .batchUpdate(documentId=file_id, body={"requests": requests})
-        .execute()
-    )
-
-    replacements = 0
-    if "replies" in result and result["replies"]:
-        reply = result["replies"][0]
-        if "replaceAllText" in reply:
-            replacements = reply["replaceAllText"].get("occurrencesChanged", 0)
-
-    return f"Replaced {replacements} occurrence(s) of '{find_text}' with '{replace_text}'."
-
-
-def _find_text_ranges_in_body(body: dict, find_text: str) -> list:
-    """Return [(startIndex, endIndex), ...] for every occurrence of find_text within a body."""
-    ranges = []
-    content = (body or {}).get("content", []) or []
-    for el in content:
-        para = el.get("paragraph")
-        if not para:
-            continue
-        # Build concatenated text + offset map for this paragraph's text runs.
-        parts = []
-        offsets = []  # list of (text_offset_in_paragraph_buffer, docStartIndex)
-        buf = ""
-        for run in para.get("elements", []) or []:
-            tr = run.get("textRun")
-            if not tr:
-                continue
-            run_text = tr.get("content", "") or ""
-            # startIndex lives on the run-element wrapper, not on textRun itself.
-            start = run.get("startIndex")
-            if start is None:
-                start = tr.get("startIndex")
-            if start is None:
-                continue
-            offsets.append((len(buf), start))
-            buf += run_text
-            parts.append(run_text)
-        if not buf or find_text not in buf:
-            continue
-        # Find all occurrences in buf, map back to doc indices.
-        search_from = 0
-        while True:
-            i = buf.find(find_text, search_from)
-            if i < 0:
-                break
-            # Map buf-offset i to doc index by finding the run it falls in.
-            doc_start = None
-            for buf_off, doc_off in offsets:
-                if buf_off <= i:
-                    doc_start = doc_off + (i - buf_off)
-                else:
-                    break
-            if doc_start is not None:
-                ranges.append((doc_start, doc_start + len(find_text)))
-            search_from = i + max(1, len(find_text))
-    return ranges
-
-
-def _find_text_ranges(doc: dict, find_text: str, tab_id: str = None) -> list:
-    """Find text ranges across a doc, handling both tabbed and non-tabbed documents.
-
-    Returns list of (start, end, tab_id) tuples. tab_id is None for non-tabbed docs.
-    If tab_id is provided, only that tab is searched.
+    Default behavior replaces exactly one match and raises on ambiguity. Use
+    replace_all=True or occurrence=N when multiple matches are intentional.
     """
+    logger.info(
+        f"[find_and_replace_doc] Doc={file_id}, find='{find_text}', replace='{replace_text}', tab_id={tab_id}, all={replace_all}, occurrence={occurrence}, dry_run={dry_run}"
+    )
+    if not find_text:
+        raise ValueError("--find text is required.")
+    if replace_all and occurrence is not None:
+        raise ValueError("--all and --occurrence are mutually exclusive.")
+    if occurrence is not None and occurrence < 1:
+        raise ValueError("--occurrence must be 1-based and positive.")
+
+    doc = _fetch_doc_with_tabs(service, file_id)
+    revision_before = _revision_id(doc)
+    matches = _find_text_matches(doc, find_text, tab_id=tab_id, match_case=match_case)
+    before_find_count = len(matches)
+    before_replace_count = _count_text_matches(
+        doc, replace_text, tab_id=tab_id, match_case=match_case,
+    ) if replace_text else 0
+
+    if not matches:
+        raise ValueError(f"text not found: '{find_text}'")
+
+    if replace_all:
+        selected = matches
+    elif occurrence is not None:
+        if occurrence > len(matches):
+            raise ValueError(
+                f"occurrence {occurrence} requested but only {len(matches)} match(es) found."
+            )
+        selected = [matches[occurrence - 1]]
+    else:
+        if len(matches) != 1:
+            raise ValueError(
+                f"found {len(matches)} matches for '{find_text}'. Use --all or --occurrence N."
+            )
+        selected = matches
+
+    planned_changes = [
+        {
+            "match_index": match["match_index"],
+            "start_index": match["start_index"],
+            "end_index": match["end_index"],
+            "tab_id": match.get("tab_id"),
+            "replace_with": replace_text,
+            "text_preview": match.get("text_preview"),
+        }
+        for match in selected
+    ]
+
+    target = {
+        "find": find_text,
+        "replace": replace_text,
+        "match_case": match_case,
+        "tab_id": tab_id,
+        "mode": "all" if replace_all else ("occurrence" if occurrence else "single"),
+        "occurrence": occurrence,
+        "preserve_style": preserve_style,
+    }
+
+    if dry_run:
+        return _mutation_result(
+            ok=True,
+            file_id=file_id,
+            title=doc.get("title"),
+            dry_run=True,
+            revision_before=revision_before,
+            target=target,
+            planned_changes=planned_changes,
+            verification={
+                "before_find_count": before_find_count,
+                "before_replace_count": before_replace_count,
+                "selected_count": len(selected),
+            },
+        )
+
+    requests = []
+    for match in sorted(selected, key=lambda m: m["start_index"], reverse=True):
+        rng = {
+            "startIndex": match["start_index"],
+            "endIndex": match["end_index"],
+        }
+        effective_tab_id = tab_id or match.get("tab_id")
+        if effective_tab_id:
+            rng["tabId"] = effective_tab_id
+        requests.append({"deleteContentRange": {"range": rng}})
+        if replace_text:
+            loc = {"index": match["start_index"]}
+            if effective_tab_id:
+                loc["tabId"] = effective_tab_id
+            requests.append({"insertText": {"location": loc, "text": replace_text}})
+            if preserve_style:
+                style = match.get("text_style") or {}
+                fields = _text_style_fields(style)
+                if style and fields:
+                    style_rng = {
+                        "startIndex": match["start_index"],
+                        "endIndex": match["start_index"] + len(replace_text),
+                    }
+                    if effective_tab_id:
+                        style_rng["tabId"] = effective_tab_id
+                    requests.append({
+                        "updateTextStyle": {
+                            "range": style_rng,
+                            "textStyle": style,
+                            "fields": ",".join(fields),
+                        }
+                    })
+
+    _batch_update_with_revision(
+        service,
+        file_id,
+        requests,
+        required_revision_id=revision_before,
+    )
+
+    revision_after = None
+    verification = {"requested_verify": verify}
+    if verify:
+        doc_after = _fetch_doc_with_tabs(service, file_id)
+        revision_after = _revision_id(doc_after)
+        after_find_count = _count_text_matches(
+            doc_after, find_text, tab_id=tab_id, match_case=match_case,
+        )
+        after_replace_count = _count_text_matches(
+            doc_after, replace_text, tab_id=tab_id, match_case=match_case,
+        ) if replace_text else 0
+        expected_find_count = None
+        find_count_ok = None
+        find_in_replace = (
+            find_text in replace_text
+            if match_case
+            else find_text.lower() in replace_text.lower()
+        )
+        same_text = (
+            replace_text == find_text
+            if match_case
+            else replace_text.lower() == find_text.lower()
+        )
+        if not find_in_replace:
+            expected_find_count = before_find_count - len(selected)
+            find_count_ok = after_find_count == expected_find_count
+        replace_count_ok = True
+        if replace_text and not same_text:
+            replace_count_ok = after_replace_count >= before_replace_count + len(selected)
+        verification.update({
+            "before_find_count": before_find_count,
+            "after_find_count": after_find_count,
+            "expected_find_count": expected_find_count,
+            "find_count_ok": find_count_ok,
+            "before_replace_count": before_replace_count,
+            "after_replace_count": after_replace_count,
+            "replace_count_ok": replace_count_ok,
+            "verified": (find_count_ok is not False) and replace_count_ok,
+        })
+    else:
+        verification.update({
+            "before_find_count": before_find_count,
+            "before_replace_count": before_replace_count,
+            "selected_count": len(selected),
+            "verified": None,
+        })
+
+    return _mutation_result(
+        ok=verification.get("verified") is not False,
+        file_id=file_id,
+        title=doc.get("title"),
+        dry_run=False,
+        revision_before=revision_before,
+        revision_after=revision_after,
+        target=target,
+        planned_changes=planned_changes,
+        applied_changes=planned_changes,
+        verification=verification,
+    )
+
+
+def _text_style_fields(style: Dict[str, Any]) -> List[str]:
+    """Fields mask for a Docs textStyle dict."""
+    supported = [
+        "bold",
+        "italic",
+        "underline",
+        "strikethrough",
+        "baselineOffset",
+        "fontSize",
+        "weightedFontFamily",
+        "foregroundColor",
+        "backgroundColor",
+        "link",
+    ]
+    return [field for field in supported if field in (style or {})]
+
+
+def _iter_paragraph_matches(
+    paragraph: Dict[str, Any],
+    find_text: str,
+    *,
+    match_case: bool,
+    tab_id: str = None,
+) -> List[Dict[str, Any]]:
+    """Return match dictionaries within one paragraph, across text runs."""
+    runs = []
+    buf = ""
+    for pe in paragraph.get("elements", []) or []:
+        tr = pe.get("textRun")
+        if not tr:
+            continue
+        run_text = tr.get("content", "") or ""
+        start = pe.get("startIndex")
+        end = pe.get("endIndex")
+        if start is None or end is None:
+            continue
+        runs.append({
+            "buf_start": len(buf),
+            "buf_end": len(buf) + len(run_text),
+            "doc_start": start,
+            "doc_end": end,
+            "text": run_text,
+            "text_style": tr.get("textStyle", {}) or {},
+        })
+        buf += run_text
+
+    if not buf:
+        return []
+
+    haystack = buf if match_case else buf.lower()
+    needle = find_text if match_case else find_text.lower()
+    matches = []
+    search_from = 0
+    while True:
+        pos = haystack.find(needle, search_from)
+        if pos < 0:
+            break
+        end_pos = pos + len(needle)
+        doc_start = None
+        doc_end = None
+        text_style = {}
+        for run in runs:
+            if run["buf_start"] <= pos < run["buf_end"]:
+                doc_start = run["doc_start"] + (pos - run["buf_start"])
+                text_style = run["text_style"]
+            if run["buf_start"] < end_pos <= run["buf_end"]:
+                doc_end = run["doc_start"] + (end_pos - run["buf_start"])
+                break
+        if doc_start is not None and doc_end is not None:
+            preview_start = max(0, pos - 40)
+            preview_end = min(len(buf), end_pos + 40)
+            matches.append({
+                "start_index": doc_start,
+                "end_index": doc_end,
+                "tab_id": tab_id,
+                "text_style": text_style,
+                "text_preview": buf[preview_start:preview_end].strip(),
+            })
+        search_from = pos + max(1, len(needle))
+    return matches
+
+
+def _find_text_matches_in_elements(
+    elements: List[Dict[str, Any]],
+    find_text: str,
+    *,
+    match_case: bool,
+    tab_id: str = None,
+) -> List[Dict[str, Any]]:
+    matches = []
+    for el in elements or []:
+        para = el.get("paragraph")
+        if para:
+            matches.extend(
+                _iter_paragraph_matches(
+                    para, find_text, match_case=match_case, tab_id=tab_id,
+                )
+            )
+        table = el.get("table")
+        if table:
+            for row in table.get("tableRows", []) or []:
+                for cell in row.get("tableCells", []) or []:
+                    matches.extend(
+                        _find_text_matches_in_elements(
+                            cell.get("content", []) or [],
+                            find_text,
+                            match_case=match_case,
+                            tab_id=tab_id,
+                        )
+                    )
+        toc = el.get("tableOfContents")
+        if toc:
+            matches.extend(
+                _find_text_matches_in_elements(
+                    toc.get("content", []) or [],
+                    find_text,
+                    match_case=match_case,
+                    tab_id=tab_id,
+                )
+            )
+    return matches
+
+
+def _iter_doc_tabs(doc: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Flatten top-level and nested tabs."""
+    out = []
+
+    def walk(tabs):
+        for tab in tabs or []:
+            out.append(tab)
+            walk(tab.get("childTabs", []) or [])
+
+    walk(doc.get("tabs", []) or [])
+    return out
+
+
+def _find_text_matches(
+    doc: Dict[str, Any],
+    find_text: str,
+    *,
+    tab_id: str = None,
+    match_case: bool = True,
+) -> List[Dict[str, Any]]:
+    """Find text matches across document body/tabs."""
     results = []
-    body = doc.get("body")
-    if body:
-        for s, e in _find_text_ranges_in_body(body, find_text):
-            results.append((s, e, None))
-    for tab in doc.get("tabs", []) or []:
+    body = doc.get("body") or {}
+    if body and not tab_id:
+        results.extend(
+            _find_text_matches_in_elements(
+                body.get("content", []) or [],
+                find_text,
+                match_case=match_case,
+                tab_id=None,
+            )
+        )
+    for tab in _iter_doc_tabs(doc):
         this_tab_id = (tab.get("tabProperties") or {}).get("tabId")
         if tab_id and this_tab_id != tab_id:
             continue
-        doc_tab_body = (tab.get("documentTab") or {}).get("body")
-        for s, e in _find_text_ranges_in_body(doc_tab_body, find_text):
-            results.append((s, e, this_tab_id))
+        doc_tab_body = (tab.get("documentTab") or {}).get("body") or {}
+        results.extend(
+            _find_text_matches_in_elements(
+                doc_tab_body.get("content", []) or [],
+                find_text,
+                match_case=match_case,
+                tab_id=this_tab_id,
+            )
+        )
+    results.sort(key=lambda m: (m.get("tab_id") or "", m["start_index"]))
+    for idx, match in enumerate(results, start=1):
+        match["match_index"] = idx
     return results
+
+
+def _count_text_matches(
+    doc: Dict[str, Any],
+    find_text: str,
+    *,
+    tab_id: str = None,
+    match_case: bool = True,
+) -> int:
+    if not find_text:
+        return 0
+    return len(_find_text_matches(doc, find_text, tab_id=tab_id, match_case=match_case))
+
+
+def _find_text_ranges(doc: dict, find_text: str, tab_id: str = None) -> list:
+    """Backward-compatible range tuples for callers such as add_link."""
+    return [
+        (m["start_index"], m["end_index"], m.get("tab_id"))
+        for m in _find_text_matches(doc, find_text, tab_id=tab_id, match_case=True)
+    ]
 
 
 def add_link(
@@ -2210,15 +3031,6 @@ def _char_width_pt(font_size_pt: float) -> float:
     return _CHAR_WIDTH_BY_SIZE[11]
 
 
-def _fetch_doc_with_tabs(service, file_id):
-    """Fetch a document with tabs content (needed for per-tab documentStyle)."""
-    return (
-        service.documents()
-        .get(documentId=file_id, includeTabsContent=True)
-        .execute()
-    )
-
-
 def _document_style_for_tab(doc, tab_id):
     """Return the documentStyle dict for the given tab_id, falling back to the
     first top-level tab if tab_id is None, and finally to the doc-level style.
@@ -2314,6 +3126,56 @@ def _cell_text(cell):
     return text.rstrip("\n")
 
 
+def _table_matrix(table_el):
+    """Return a plain-text matrix for a Docs table element."""
+    rows = table_el.get("table", {}).get("tableRows", []) or []
+    matrix = []
+    for row in rows:
+        matrix.append([
+            _cell_text(cell)
+            for cell in row.get("tableCells", []) or []
+        ])
+    return matrix
+
+
+def _table_fingerprint(table_el):
+    """Stable content fingerprint for guarding table mutations."""
+    payload = json.dumps(_table_matrix(table_el), ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _paragraph_plain_text(element):
+    paragraph = element.get("paragraph") or {}
+    parts = []
+    for pe in paragraph.get("elements", []) or []:
+        tr = pe.get("textRun")
+        if tr and "content" in tr:
+            parts.append(tr.get("content", ""))
+    return "".join(parts).strip()
+
+
+def _nearest_text_before(body_content, element_index, *, heading_only=False):
+    """Return nearest nonempty paragraph text before a body element."""
+    for prev in reversed((body_content or [])[:element_index]):
+        para = prev.get("paragraph")
+        if not para:
+            continue
+        style_type = (
+            para.get("paragraphStyle", {}) or {}
+        ).get("namedStyleType", "NORMAL_TEXT")
+        if heading_only and not str(style_type).startswith("HEADING_"):
+            continue
+        text = _paragraph_plain_text(prev)
+        if text:
+            return {
+                "text": _truncate(text, 120),
+                "named_style_type": style_type,
+                "start_index": prev.get("startIndex"),
+                "end_index": prev.get("endIndex"),
+            }
+    return None
+
+
 def _column_widths_for_table(table_el, inner_page_width_pt):
     """Return a list of per-column dicts: {width_pt, width_type, is_explicit}.
 
@@ -2363,6 +3225,19 @@ def list_doc_tables(service, file_id: str = "", tab_id: str = None) -> str:
 
     doc = _fetch_doc_with_tabs(service, file_id)
     tables, doc_style, tab_title = _collect_tab_tables(doc, tab_id)
+    body_content = _get_body_content(doc, tab_id)
+    table_context_by_start = {}
+    for element_idx, element in enumerate(body_content or []):
+        if "table" not in element:
+            continue
+        table_context_by_start[element.get("startIndex")] = {
+            "heading_before": _nearest_text_before(
+                body_content, element_idx, heading_only=True,
+            ),
+            "text_before": _nearest_text_before(
+                body_content, element_idx, heading_only=False,
+            ),
+        }
 
     inner_w = _inner_page_width_pt(doc_style)
 
@@ -2381,6 +3256,12 @@ def list_doc_tables(service, file_id: str = "", tab_id: str = None) -> str:
         if rows:
             for cell in rows[0].get("tableCells", []) or []:
                 first_row_preview.append(_truncate(_cell_text(cell), 30))
+        matrix = _table_matrix(el)
+        matrix_preview = [
+            [_truncate(cell, 40) for cell in row]
+            for row in matrix[:3]
+        ]
+        context = table_context_by_start.get(el.get("startIndex"), {})
 
         # Longest cell per column (chars). Skip header row so these numbers
         # reflect body content, which is usually where wrapping decisions
@@ -2399,6 +3280,9 @@ def list_doc_tables(service, file_id: str = "", tab_id: str = None) -> str:
             "index": idx,
             "start_index": el.get("startIndex"),
             "end_index": el.get("endIndex"),
+            "content_fingerprint": _table_fingerprint(el),
+            "heading_before": context.get("heading_before"),
+            "text_before": context.get("text_before"),
             "rows": n_rows,
             "columns": n_cols,
             "columns_detail": [
@@ -2414,6 +3298,7 @@ def list_doc_tables(service, file_id: str = "", tab_id: str = None) -> str:
             ],
             "total_width_pt": total_width,
             "first_row_preview": first_row_preview,
+            "matrix_preview": matrix_preview,
         })
 
     result = {
@@ -2434,6 +3319,8 @@ def set_table_column_widths(
     widths: List[float] = None,
     unit: str = "PT",
     tab_id: str = None,
+    expected_fingerprint: str = None,
+    dry_run: bool = False,
 ) -> str:
     """Set fixed-width columns on a specific table by position.
 
@@ -2454,6 +3341,7 @@ def set_table_column_widths(
         return "Error: 'widths' (list of per-column widths) is required."
 
     doc = _fetch_doc_with_tabs(service, file_id)
+    revision_before = _revision_id(doc)
     tables, _doc_style, _tab_title = _collect_tab_tables(doc, tab_id)
     if table_index < 0 or table_index >= len(tables):
         return (
@@ -2462,6 +3350,12 @@ def set_table_column_widths(
         )
 
     table_el = tables[table_index]
+    fingerprint_before = _table_fingerprint(table_el)
+    if expected_fingerprint and expected_fingerprint != fingerprint_before:
+        raise ValueError(
+            "table fingerprint mismatch: "
+            f"expected {expected_fingerprint}, found {fingerprint_before}."
+        )
     tbl = table_el["table"]
     rows = tbl.get("tableRows", []) or []
     n_cols = len(rows[0].get("tableCells", [])) if rows else 0
@@ -2492,20 +3386,261 @@ def set_table_column_widths(
 
     _apply_tab_id(requests, tab_id)
 
-    service.documents().batchUpdate(
-        documentId=file_id, body={"requests": requests}
-    ).execute()
-
-    return json.dumps({
-        "updated": True,
-        "file_id": file_id,
-        "tab_id": tab_id,
+    planned = [{
         "table_index": table_index,
         "table_start_index": start_index,
         "columns": n_cols,
         "widths": [float(w) for w in widths],
         "unit": unit,
-    }, indent=2)
+        "fingerprint_before": fingerprint_before,
+    }]
+
+    if dry_run:
+        return _mutation_result(
+            ok=True,
+            file_id=file_id,
+            title=doc.get("title"),
+            dry_run=True,
+            revision_before=revision_before,
+            target={"tab_id": tab_id, "table_index": table_index},
+            planned_changes=planned,
+            verification={
+                "current_fingerprint": fingerprint_before,
+                "expected_fingerprint": expected_fingerprint,
+            },
+        )
+
+    _batch_update_with_revision(
+        service,
+        file_id,
+        requests,
+        required_revision_id=revision_before,
+    )
+
+    doc_after = _fetch_doc_with_tabs(service, file_id)
+    revision_after = _revision_id(doc_after)
+    tables_after, doc_style_after, _ = _collect_tab_tables(doc_after, tab_id)
+    table_after = tables_after[table_index] if table_index < len(tables_after) else None
+    actual_widths = []
+    width_ok = False
+    if table_after is not None:
+        inner_after = _inner_page_width_pt(doc_style_after)
+        actual_widths = [
+            c["width_pt"]
+            for c in _column_widths_for_table(table_after, inner_after)
+        ]
+        width_ok = len(actual_widths) == len(widths) and all(
+            abs(float(a) - float(b)) < 0.05
+            for a, b in zip(actual_widths, widths)
+        )
+
+    return _mutation_result(
+        ok=width_ok,
+        file_id=file_id,
+        title=doc.get("title"),
+        dry_run=False,
+        revision_before=revision_before,
+        revision_after=revision_after,
+        target={"tab_id": tab_id, "table_index": table_index},
+        planned_changes=planned,
+        applied_changes=planned,
+        verification={
+            "verified": width_ok,
+            "actual_widths": actual_widths,
+            "expected_widths": [float(w) for w in widths],
+            "fingerprint_before": fingerprint_before,
+            "fingerprint_after": _table_fingerprint(table_after) if table_after else None,
+        },
+    )
+
+
+def write_table_data(
+    service,
+    file_id: str = "",
+    table_index: int = 0,
+    table_data: List[List[Any]] = None,
+    tab_id: str = None,
+    expected_fingerprint: str = None,
+    dry_run: bool = False,
+    verify: bool = True,
+    bold_headers: bool = False,
+) -> str:
+    """Overwrite an existing table's cell text with an exact-size matrix."""
+    logger.info(
+        f"[write_table_data] Doc={file_id}, table_index={table_index}, "
+        f"tab_id={tab_id}, dry_run={dry_run}"
+    )
+    if not file_id:
+        return "Error: 'file_id' is required."
+    if not isinstance(table_data, list) or not table_data:
+        raise ValueError("--data must be a non-empty JSON array of rows.")
+    if not all(isinstance(row, list) for row in table_data):
+        raise ValueError("--data must be a JSON array of row arrays.")
+
+    normalized_data = [
+        ["" if cell is None else str(cell) for cell in row]
+        for row in table_data
+    ]
+    expected_cols = len(normalized_data[0])
+    if expected_cols == 0:
+        raise ValueError("--data rows must have at least one column.")
+    if any(len(row) != expected_cols for row in normalized_data):
+        raise ValueError("--data must be rectangular; all rows need the same length.")
+
+    doc = _fetch_doc_with_tabs(service, file_id)
+    revision_before = _revision_id(doc)
+    tables, _doc_style, _tab_title = _collect_tab_tables(doc, tab_id)
+    if table_index < 0 or table_index >= len(tables):
+        raise ValueError(
+            f"table_index {table_index} out of range "
+            f"(tab has {len(tables)} table(s))."
+        )
+
+    table_el = tables[table_index]
+    fingerprint_before = _table_fingerprint(table_el)
+    if expected_fingerprint and expected_fingerprint != fingerprint_before:
+        raise ValueError(
+            "table fingerprint mismatch: "
+            f"expected {expected_fingerprint}, found {fingerprint_before}."
+        )
+
+    current_matrix = _table_matrix(table_el)
+    rows = table_el.get("table", {}).get("tableRows", []) or []
+    current_rows = len(rows)
+    current_cols = len(rows[0].get("tableCells", [])) if rows else 0
+    target_rows = len(normalized_data)
+    target_cols = expected_cols
+    if (current_rows, current_cols) != (target_rows, target_cols):
+        raise ValueError(
+            "table dimensions differ; table-write currently requires exact dimensions. "
+            f"Current table is {current_rows}x{current_cols}, data is {target_rows}x{target_cols}."
+        )
+
+    changed_cells = []
+    requests: List[Dict[str, Any]] = []
+    for r_idx in range(current_rows - 1, -1, -1):
+        row = rows[r_idx]
+        cells = row.get("tableCells", []) or []
+        for c_idx in range(current_cols - 1, -1, -1):
+            cell = cells[c_idx]
+            old_text = current_matrix[r_idx][c_idx]
+            new_text = normalized_data[r_idx][c_idx]
+            if old_text == new_text:
+                continue
+            cell_start = cell.get("startIndex")
+            cell_end = cell.get("endIndex")
+            if cell_start is None or cell_end is None:
+                raise ValueError(f"could not determine indices for cell {r_idx},{c_idx}")
+            delete_start = cell_start + 1
+            delete_end = cell_end - 1
+            if delete_end > delete_start:
+                rng = {"startIndex": delete_start, "endIndex": delete_end}
+                if tab_id:
+                    rng["tabId"] = tab_id
+                requests.append({"deleteContentRange": {"range": rng}})
+            if new_text:
+                loc = {"index": delete_start}
+                if tab_id:
+                    loc["tabId"] = tab_id
+                requests.append({"insertText": {"location": loc, "text": new_text}})
+                if bold_headers and r_idx == 0:
+                    style_rng = {
+                        "startIndex": delete_start,
+                        "endIndex": delete_start + len(new_text),
+                    }
+                    if tab_id:
+                        style_rng["tabId"] = tab_id
+                    requests.append({
+                        "updateTextStyle": {
+                            "range": style_rng,
+                            "textStyle": {"bold": True},
+                            "fields": "bold",
+                        }
+                    })
+            changed_cells.append({
+                "row": r_idx,
+                "column": c_idx,
+                "old": old_text,
+                "new": new_text,
+            })
+
+    planned = [{
+        "table_index": table_index,
+        "table_start_index": table_el.get("startIndex"),
+        "rows": current_rows,
+        "columns": current_cols,
+        "changed_cells": len(changed_cells),
+        "fingerprint_before": fingerprint_before,
+    }]
+
+    if dry_run:
+        return _mutation_result(
+            ok=True,
+            file_id=file_id,
+            title=doc.get("title"),
+            dry_run=True,
+            revision_before=revision_before,
+            target={"tab_id": tab_id, "table_index": table_index},
+            planned_changes=planned,
+            verification={
+                "current_fingerprint": fingerprint_before,
+                "expected_fingerprint": expected_fingerprint,
+                "changed_cells_preview": changed_cells[:20],
+                "changed_cells_truncated": len(changed_cells) > 20,
+            },
+        )
+
+    if requests:
+        CHUNK = 400
+        required_revision = revision_before
+        for i in range(0, len(requests), CHUNK):
+            _batch_update_with_revision(
+                service,
+                file_id,
+                requests[i:i + CHUNK],
+                required_revision_id=required_revision,
+            )
+            if i + CHUNK < len(requests):
+                required_revision = _revision_id(_fetch_doc_with_tabs(service, file_id))
+
+    revision_after = None
+    verification = {"requested_verify": verify}
+    if verify:
+        doc_after = _fetch_doc_with_tabs(service, file_id)
+        revision_after = _revision_id(doc_after)
+        tables_after, _doc_style_after, _ = _collect_tab_tables(doc_after, tab_id)
+        table_after = tables_after[table_index] if table_index < len(tables_after) else None
+        actual_matrix = _table_matrix(table_after) if table_after else None
+        matrix_ok = actual_matrix == normalized_data
+        verification.update({
+            "verified": matrix_ok,
+            "matrix_matches": matrix_ok,
+            "fingerprint_before": fingerprint_before,
+            "fingerprint_after": _table_fingerprint(table_after) if table_after else None,
+            "changed_cells": len(changed_cells),
+        })
+        if not matrix_ok:
+            verification["actual_preview"] = actual_matrix[:3] if actual_matrix else None
+            verification["expected_preview"] = normalized_data[:3]
+    else:
+        verification.update({
+            "verified": None,
+            "fingerprint_before": fingerprint_before,
+            "changed_cells": len(changed_cells),
+        })
+
+    return _mutation_result(
+        ok=verification.get("verified") is not False,
+        file_id=file_id,
+        title=doc.get("title"),
+        dry_run=False,
+        revision_before=revision_before,
+        revision_after=revision_after,
+        target={"tab_id": tab_id, "table_index": table_index},
+        planned_changes=planned,
+        applied_changes=planned if requests else [],
+        verification=verification,
+    )
 
 
 def table_wrap_estimate(
