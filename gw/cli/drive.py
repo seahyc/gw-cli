@@ -112,6 +112,7 @@ def cmd_upload(args):
             name=getattr(args, "name", None),
             parent_id=getattr(args, "parent", None),
             mime_type=getattr(args, "mime_type", None),
+            convert=getattr(args, "convert", False),
         )
         success(result)
     except Exception as e:
@@ -280,7 +281,12 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("local_path", help="Path to local file")
     p.add_argument("--name", default=None, help="Override file name")
     p.add_argument("--parent", default=None, help="Parent folder ID")
-    p.add_argument("--mime-type", default=None, help="MIME type override")
+    p.add_argument("--mime-type", default=None, help="Source file MIME type override (not the target type)")
+    p.add_argument(
+        "--convert",
+        action="store_true",
+        help="Convert to a Google Doc/Sheet/Slides (e.g. .html/.docx/.md -> Doc, .csv/.xlsx -> Sheet)",
+    )
     p.set_defaults(func=cmd_upload)
 
     # -- copy -----------------------------------------------------------------

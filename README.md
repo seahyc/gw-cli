@@ -16,7 +16,7 @@ git clone https://github.com/seahyc/gw-cli.git ~/Code/gw-cli
 mkdir -p ~/.local/bin
 cat > ~/.local/bin/gw << 'EOF'
 #!/bin/bash
-exec uv run --directory ~/Code/gw-cli python -m gw "$@"
+exec uv run --project ~/Code/gw-cli python -m gw "$@"
 EOF
 chmod +x ~/.local/bin/gw
 ```

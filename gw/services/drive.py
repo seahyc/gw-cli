@@ -350,14 +350,40 @@ def create_folder(
     )
 
 
+_GDOC = "application/vnd.google-apps.document"
+_GSHEET = "application/vnd.google-apps.spreadsheet"
+_GSLIDES = "application/vnd.google-apps.presentation"
+
+# Source MIME type -> Google-native type Drive can convert it into on upload.
+GOOGLE_CONVERT_TARGETS = {
+    "text/html": _GDOC,
+    "text/plain": _GDOC,
+    "text/markdown": _GDOC,
+    "application/rtf": _GDOC,
+    "application/msword": _GDOC,
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": _GDOC,
+    "application/vnd.oasis.opendocument.text": _GDOC,
+    "text/csv": _GSHEET,
+    "application/vnd.ms-excel": _GSHEET,
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": _GSHEET,
+    "application/vnd.ms-powerpoint": _GSLIDES,
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": _GSLIDES,
+}
+
+
 def upload_file(
     service,
     local_path: str,
     name: Optional[str] = None,
     parent_id: Optional[str] = None,
     mime_type: Optional[str] = None,
+    convert: bool = False,
 ) -> str:
-    """Upload a local file to Google Drive."""
+    """Upload a local file to Google Drive.
+
+    With convert=True, Drive converts the file to the matching Google format
+    (HTML/Word/text/Markdown -> Docs, CSV/Excel -> Sheets, PowerPoint -> Slides).
+    """
     path = Path(local_path)
     if not path.exists():
         raise FileNotFoundError(f"Local file not found: {local_path}")
@@ -368,6 +394,16 @@ def upload_file(
         mime_type = mime_type or "application/octet-stream"
 
     file_metadata: Dict[str, Any] = {"name": upload_name}
+    if convert:
+        target = GOOGLE_CONVERT_TARGETS.get(mime_type)
+        if not target:
+            raise ValueError(
+                f"Cannot convert '{mime_type}' to a Google format. Supported: "
+                + ", ".join(sorted(GOOGLE_CONVERT_TARGETS))
+            )
+        file_metadata["mimeType"] = target
+        if upload_name == path.name:
+            file_metadata["name"] = path.stem
     if parent_id:
         resolved_parent = resolve_folder_id(service, parent_id)
         file_metadata["parents"] = [resolved_parent]

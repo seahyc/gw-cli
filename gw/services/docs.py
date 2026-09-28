@@ -2142,7 +2142,9 @@ def insert_markdown(
                     cell = header_row["tableCells"][c_idx]
                     cs = cell["startIndex"]
                     ce = cell["endIndex"]
-                    if ce - cs > 1:
+                    # An empty cell spans only its paragraph newline
+                    # (ce - cs == 2); styling it would be a zero-length range.
+                    if ce - cs > 2:
                         rng = {"startIndex": cs + 1, "endIndex": ce - 1}
                         if tab_id:
                             rng["tabId"] = tab_id

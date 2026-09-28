@@ -29,3 +29,6 @@ mcp_server_debug.log
 # ---- Local development files -------------------------------------------
 /.credentials
 /.claude
+
+# Local scratch data (never commit; this repo is public)
+scratch/
