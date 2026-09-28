@@ -18,7 +18,16 @@ def register(subparsers):
     p_create.add_argument("file_id")
     p_create.add_argument("--content", required=True)
     p_create.add_argument("--quoted-text", default="")
-    p_create.add_argument("--service", choices=["docs"], default=None, help="Use docs service for text anchoring")
+    # dest is deliberately not "service" -- the root parser's top-level
+    # subparsers action also uses dest="service" on the shared Namespace,
+    # and argparse has no per-subparser namespace isolation. Reusing that
+    # name here silently clobbers the top-level service selection (e.g.
+    # "docs") with this flag's value (e.g. "docs" too, but only by luck of
+    # the value; with any other value dispatch breaks) after parsing.
+    p_create.add_argument(
+        "--service", choices=["docs"], default=None, dest="anchor_service",
+        help="Use docs service for text anchoring",
+    )
 
     # comments reply
     p_reply = sub.add_parser("reply", help="Reply to a comment")
@@ -88,7 +97,7 @@ def cmd_list(args):
 def cmd_create(args):
     try:
         service = get_service("drive")
-        docs_service = get_service("docs") if args.service == "docs" else None
+        docs_service = get_service("docs") if args.anchor_service == "docs" else None
         result = comments.create_comment(
             service,
             args.file_id,

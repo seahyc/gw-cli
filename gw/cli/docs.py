@@ -443,17 +443,26 @@ def cmd_append_markdown(args):
 
 
 def cmd_replace_markdown(args):
-    """Clear the doc body (or target tab) and replace it with markdown."""
+    """Replace the doc body (or target tab) with markdown.
+
+    By default this clears the whole target and re-inserts the rendered
+    markdown (fast, but detaches any comment anchored inside the cleared
+    range -- the Docs API cannot re-anchor a comment once its quoted text
+    is gone). Pass --preserve-comments to instead diff the current body
+    against the new markdown at paragraph/table granularity and only touch
+    what actually changed, so comments anchored to unchanged text survive.
+    """
     try:
-        service = get_service("docs")
+        drive_service, service = get_services("drive", "docs")
         md_text = _read_markdown_source(args)
-        result = docs.insert_markdown(
+        result = docs.replace_markdown_doc(
             service,
             args.file_id,
             markdown_text=md_text,
             tab_id=args.tab_id,
-            start_index=1,
-            replace=True,
+            preserve_comments=args.preserve_comments,
+            dry_run=args.dry_run,
+            drive_service=drive_service,
         )
         success(result)
     except FileNotFoundError as e:
@@ -906,6 +915,21 @@ def register(subparsers):
     p.add_argument("--stdin", action="store_true", help="Read markdown from stdin")
     p.add_argument("--content", help="Markdown content as a string")
     p.add_argument("--tab-id", help="If set, target this tab instead of the default body")
+    p.add_argument(
+        "--preserve-comments",
+        action="store_true",
+        help=(
+            "Diff the current body against the new markdown at paragraph/table "
+            "granularity and only delete/insert what changed, so comments anchored "
+            "to unchanged text stay anchored. Without this flag, the whole target "
+            "is cleared and re-inserted (any anchored comment inside it detaches)."
+        ),
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview the planned change (paragraph diff in --preserve-comments mode) without writing",
+    )
     p.set_defaults(func=cmd_replace_markdown)
 
     # list-in-folder

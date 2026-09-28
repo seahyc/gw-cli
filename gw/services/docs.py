@@ -5,6 +5,7 @@ Pure synchronous functions for interacting with the Google Docs and Drive APIs.
 Each function accepts pre-authenticated service client(s) and returns a string result.
 """
 
+import difflib
 import io
 import json
 import logging
@@ -44,6 +45,7 @@ from gw.services._helpers.docs_markdown import (
     build_paragraph_block,
     build_list_block,
     build_quote_block,
+    _runs_plain_text as _md_runs_plain_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -2722,6 +2724,139 @@ def _get_body_end_index(doc, tab_id):
     return content[-1].get("endIndex", 1)
 
 
+def _insert_markdown_table_block(
+    service, file_id: str, block: Dict[str, Any], cursor: int, tab_id: str = None
+) -> int:
+    """Insert a single parsed markdown table block at `cursor`.
+
+    Performs the insertTable -> refetch -> fill-cells -> bold-header dance in
+    one place so both a full markdown render and a partial (comment-safe)
+    patch can share it. Returns the cursor position immediately after the
+    inserted table (its endIndex).
+    """
+    rows = block["rows"]
+    cells_runs = block["cells_runs"]
+    n_rows = len(rows)
+    n_cols = max(len(r) for r in rows) if rows else 0
+    if n_rows == 0 or n_cols == 0:
+        return cursor
+    cells_runs_norm = [cr + [[]] * (n_cols - len(cr)) for cr in cells_runs]
+
+    insert_table_loc = {"index": cursor}
+    if tab_id:
+        insert_table_loc["tabId"] = tab_id
+    service.documents().batchUpdate(
+        documentId=file_id,
+        body={"requests": [{"insertTable": {
+            "location": insert_table_loc,
+            "rows": n_rows,
+            "columns": n_cols,
+        }}]},
+    ).execute()
+
+    doc2 = (
+        service.documents()
+        .get(documentId=file_id, includeTabsContent=True)
+        .execute()
+    )
+    body_content = _get_body_content(doc2, tab_id)
+    target_table = None
+    for el in body_content:
+        if "table" in el and el.get("startIndex", -1) >= cursor:
+            target_table = el
+            break
+    if target_table is None:
+        raise RuntimeError("Inserted table not found in document body")
+
+    fill_reqs: List[Dict[str, Any]] = []
+    for r_idx in range(n_rows - 1, -1, -1):
+        row_el = target_table["table"]["tableRows"][r_idx]
+        for c_idx in range(n_cols - 1, -1, -1):
+            cell = row_el["tableCells"][c_idx]
+            cell_start = cell["startIndex"]
+            insert_idx = cell_start + 1
+            runs = cells_runs_norm[r_idx][c_idx]
+            plain = "".join(t for t, _ in runs)
+            if not plain:
+                continue
+            loc = {"index": insert_idx}
+            if tab_id:
+                loc["tabId"] = tab_id
+            fill_reqs.append({
+                "insertText": {"location": loc, "text": plain}
+            })
+            off = insert_idx
+            for run_text, attrs in runs:
+                rl = len(run_text)
+                if attrs.get("bold"):
+                    rng = {"startIndex": off, "endIndex": off + rl}
+                    if tab_id:
+                        rng["tabId"] = tab_id
+                    fill_reqs.append({"updateTextStyle": {
+                        "range": rng,
+                        "textStyle": {"bold": True},
+                        "fields": "bold",
+                    }})
+                if attrs.get("code"):
+                    rng = {"startIndex": off, "endIndex": off + rl}
+                    if tab_id:
+                        rng["tabId"] = tab_id
+                    fill_reqs.append({"updateTextStyle": {
+                        "range": rng,
+                        "textStyle": {
+                            "weightedFontFamily": {"fontFamily": "Roboto Mono"}
+                        },
+                        "fields": "weightedFontFamily",
+                    }})
+                off += rl
+
+    CHUNK = 450
+    for i in range(0, len(fill_reqs), CHUNK):
+        service.documents().batchUpdate(
+            documentId=file_id,
+            body={"requests": fill_reqs[i:i + CHUNK]},
+        ).execute()
+
+    doc3 = (
+        service.documents()
+        .get(documentId=file_id, includeTabsContent=True)
+        .execute()
+    )
+    body_content3 = _get_body_content(doc3, tab_id)
+    target_table3 = None
+    for el in body_content3:
+        if "table" in el and el.get("startIndex", -1) >= cursor:
+            target_table3 = el
+            break
+    new_cursor = cursor
+    if target_table3 is not None:
+        header_row = target_table3["table"]["tableRows"][0]
+        hdr_reqs: List[Dict[str, Any]] = []
+        for c_idx in range(n_cols):
+            cell = header_row["tableCells"][c_idx]
+            cs = cell["startIndex"]
+            ce = cell["endIndex"]
+            # An empty cell spans only its paragraph newline
+            # (ce - cs == 2); styling it would be a zero-length range.
+            if ce - cs > 2:
+                rng = {"startIndex": cs + 1, "endIndex": ce - 1}
+                if tab_id:
+                    rng["tabId"] = tab_id
+                hdr_reqs.append({"updateTextStyle": {
+                    "range": rng,
+                    "textStyle": {"bold": True},
+                    "fields": "bold",
+                }})
+        if hdr_reqs:
+            service.documents().batchUpdate(
+                documentId=file_id, body={"requests": hdr_reqs}
+            ).execute()
+        # After a table, continue inserting at the start of the paragraph
+        # immediately following the table.
+        new_cursor = target_table3["endIndex"]
+    return new_cursor
+
+
 def insert_markdown(
     service,
     file_id: str = "",
@@ -2853,134 +2988,7 @@ def insert_markdown(
         elif btype == "table":
             # Flush text-based requests first so cursor positions stay valid.
             flush()
-            rows = block["rows"]
-            cells_runs = block["cells_runs"]
-            n_rows = len(rows)
-            n_cols = max(len(r) for r in rows) if rows else 0
-            if n_rows == 0 or n_cols == 0:
-                continue
-            # Normalize row widths
-            rows_norm = [r + [""] * (n_cols - len(r)) for r in rows]
-            cells_runs_norm = [
-                cr + [[]] * (n_cols - len(cr)) for cr in cells_runs
-            ]
-
-            # Insert empty table at cursor.
-            insert_table_loc = {"index": cursor}
-            if tab_id:
-                insert_table_loc["tabId"] = tab_id
-            service.documents().batchUpdate(
-                documentId=file_id,
-                body={"requests": [{"insertTable": {
-                    "location": insert_table_loc,
-                    "rows": n_rows,
-                    "columns": n_cols,
-                }}]},
-            ).execute()
-
-            # Re-read doc to find the new table and its cell indices.
-            doc2 = (
-                service.documents()
-                .get(documentId=file_id, includeTabsContent=True)
-                .execute()
-            )
-            body_content = _get_body_content(doc2, tab_id)
-            target_table = None
-            for el in body_content:
-                if "table" in el and el.get("startIndex", -1) >= cursor:
-                    target_table = el
-                    break
-            if target_table is None:
-                raise RuntimeError("Inserted table not found in document body")
-
-            # Build cell-fill requests in reverse order so earlier indices
-            # remain valid as we insert later content.
-            fill_reqs: List[Dict[str, Any]] = []
-            for r_idx in range(n_rows - 1, -1, -1):
-                row_el = target_table["table"]["tableRows"][r_idx]
-                for c_idx in range(n_cols - 1, -1, -1):
-                    cell = row_el["tableCells"][c_idx]
-                    cell_start = cell["startIndex"]
-                    insert_idx = cell_start + 1
-                    runs = cells_runs_norm[r_idx][c_idx]
-                    plain = "".join(t for t, _ in runs)
-                    if not plain:
-                        continue
-                    loc = {"index": insert_idx}
-                    if tab_id:
-                        loc["tabId"] = tab_id
-                    fill_reqs.append({
-                        "insertText": {"location": loc, "text": plain}
-                    })
-                    # Inline bold/code styling inside the cell
-                    off = insert_idx
-                    for run_text, attrs in runs:
-                        rl = len(run_text)
-                        if attrs.get("bold"):
-                            rng = {"startIndex": off, "endIndex": off + rl}
-                            if tab_id:
-                                rng["tabId"] = tab_id
-                            fill_reqs.append({"updateTextStyle": {
-                                "range": rng,
-                                "textStyle": {"bold": True},
-                                "fields": "bold",
-                            }})
-                        if attrs.get("code"):
-                            rng = {"startIndex": off, "endIndex": off + rl}
-                            if tab_id:
-                                rng["tabId"] = tab_id
-                            fill_reqs.append({"updateTextStyle": {
-                                "range": rng,
-                                "textStyle": {
-                                    "weightedFontFamily": {"fontFamily": "Roboto Mono"}
-                                },
-                                "fields": "weightedFontFamily",
-                            }})
-                        off += rl
-
-            for i in range(0, len(fill_reqs), CHUNK):
-                service.documents().batchUpdate(
-                    documentId=file_id,
-                    body={"requests": fill_reqs[i:i + CHUNK]},
-                ).execute()
-
-            # Bold the header row. Re-read to get fresh cell positions.
-            doc3 = (
-                service.documents()
-                .get(documentId=file_id, includeTabsContent=True)
-                .execute()
-            )
-            body_content3 = _get_body_content(doc3, tab_id)
-            target_table3 = None
-            for el in body_content3:
-                if "table" in el and el.get("startIndex", -1) >= cursor:
-                    target_table3 = el
-                    break
-            if target_table3 is not None:
-                header_row = target_table3["table"]["tableRows"][0]
-                hdr_reqs: List[Dict[str, Any]] = []
-                for c_idx in range(n_cols):
-                    cell = header_row["tableCells"][c_idx]
-                    cs = cell["startIndex"]
-                    ce = cell["endIndex"]
-                    # An empty cell spans only its paragraph newline
-                    # (ce - cs == 2); styling it would be a zero-length range.
-                    if ce - cs > 2:
-                        rng = {"startIndex": cs + 1, "endIndex": ce - 1}
-                        if tab_id:
-                            rng["tabId"] = tab_id
-                        hdr_reqs.append({"updateTextStyle": {
-                            "range": rng,
-                            "textStyle": {"bold": True},
-                            "fields": "bold",
-                        }})
-                if hdr_reqs:
-                    service.documents().batchUpdate(
-                        documentId=file_id, body={"requests": hdr_reqs}
-                    ).execute()
-                # After a table, continue inserting at the start of the
-                # paragraph immediately following the table.
-                cursor = target_table3["endIndex"]
+            cursor = _insert_markdown_table_block(service, file_id, block, cursor, tab_id)
 
     flush()
 
@@ -2992,6 +3000,445 @@ def insert_markdown(
         "start_index": start_index if not replace else 1,
         **counts,
     }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Comment-safe markdown replace
+#
+# `replace-markdown` historically cleared the whole body and re-inserted the
+# rendered markdown. That is destructive to Docs comments: the Docs API has
+# no way to re-anchor a comment once the text it was quoting has been
+# deleted, so any comment anchored inside the body detaches (it survives as
+# an unanchored comment, but loses its pinned location).
+#
+# `--preserve-comments` instead diffs the current body against the newly
+# rendered markdown at paragraph/table granularity (difflib.SequenceMatcher
+# over normalized paragraph text) and only deletes/inserts the paragraphs or
+# tables that actually changed. Anything untouched keeps its original
+# Docs-internal range, so comments anchored to it stay anchored.
+# ---------------------------------------------------------------------------
+
+def _normalize_diff_text(text: str) -> str:
+    """Normalize paragraph text for the structural (paragraph-level) diff."""
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def _old_body_items(body_content: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Flatten a doc body's content array into paragraph/table diff units.
+
+    Elements we don't model (section breaks, table of contents, etc.) are
+    left out of the diff and therefore never touched.
+    """
+    items: List[Dict[str, Any]] = []
+    for el in body_content:
+        if "paragraph" in el:
+            text = _paragraph_plain_text(el)
+            key = _normalize_diff_text(text)
+            if not key:
+                # Blank separator paragraphs (Docs auto-inserts these around
+                # tables/lists) carry no comment-relevant content and the
+                # markdown renderer never emits a standalone empty paragraph.
+                # Leaving them in the diff would spuriously widen a "replace"
+                # range across an otherwise-unchanged table. Skip them: they
+                # are simply never touched.
+                continue
+            items.append({
+                "kind": "para",
+                "key": key,
+                "start": el.get("startIndex"),
+                "end": el.get("endIndex"),
+                "element": el,
+            })
+        elif "table" in el:
+            matrix = _table_matrix(el)
+            items.append({
+                "kind": "table",
+                "key": "TABLE:" + json.dumps(matrix, ensure_ascii=False, separators=(",", ":")),
+                "start": el.get("startIndex"),
+                "end": el.get("endIndex"),
+                "element": el,
+                "matrix": matrix,
+            })
+    return items
+
+
+def _new_body_items(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Flatten parsed markdown blocks into the same paragraph/table diff units.
+
+    List blocks are exploded into one item per list item, so editing a
+    single bullet doesn't force the whole list to be rewritten.
+    """
+    items: List[Dict[str, Any]] = []
+    for block in blocks:
+        btype = block["type"]
+        if btype == "heading":
+            text = _md_runs_plain_text(block["runs"])
+            items.append({
+                "kind": "para", "new_type": "heading", "level": block["level"],
+                "runs": block["runs"], "key": _normalize_diff_text(text),
+            })
+        elif btype == "paragraph":
+            text = _md_runs_plain_text(block["runs"])
+            items.append({
+                "kind": "para", "new_type": "paragraph",
+                "runs": block["runs"], "key": _normalize_diff_text(text),
+            })
+        elif btype == "quote":
+            text = _md_runs_plain_text(block["runs"])
+            items.append({
+                "kind": "para", "new_type": "quote",
+                "runs": block["runs"], "key": _normalize_diff_text(text),
+            })
+        elif btype == "list":
+            for runs in block["items_runs"]:
+                text = _md_runs_plain_text(runs)
+                items.append({
+                    "kind": "para", "new_type": "list_item",
+                    "runs": runs, "key": _normalize_diff_text(text),
+                })
+        elif btype == "table":
+            matrix = [[_md_runs_plain_text(c) for c in row] for row in block["cells_runs"]]
+            items.append({
+                "kind": "table", "new_type": "table", "block": block,
+                "key": "TABLE:" + json.dumps(matrix, ensure_ascii=False, separators=(",", ":")),
+                "matrix": matrix,
+            })
+        # "hr" blocks are intentionally dropped, matching insert_markdown.
+    return items
+
+
+def _table_cell_rewrite_requests(table_el, new_matrix, tab_id):
+    """Diff a table element's cells against new_matrix (same dimensions) and
+    return (requests, changed_cell_count) that rewrite only changed cells,
+    in place, from the last cell backwards.
+    """
+    current_matrix = _table_matrix(table_el)
+    rows = table_el.get("table", {}).get("tableRows", []) or []
+    requests: List[Dict[str, Any]] = []
+    changed = 0
+    for r_idx in range(len(rows) - 1, -1, -1):
+        cells = rows[r_idx].get("tableCells", []) or []
+        for c_idx in range(len(cells) - 1, -1, -1):
+            cell = cells[c_idx]
+            old_text = current_matrix[r_idx][c_idx]
+            new_text = new_matrix[r_idx][c_idx]
+            if old_text == new_text:
+                continue
+            cell_start = cell.get("startIndex")
+            cell_end = cell.get("endIndex")
+            if cell_start is None or cell_end is None:
+                continue
+            delete_start = cell_start + 1
+            delete_end = cell_end - 1
+            if delete_end > delete_start:
+                rng = {"startIndex": delete_start, "endIndex": delete_end}
+                if tab_id:
+                    rng["tabId"] = tab_id
+                requests.append({"deleteContentRange": {"range": rng}})
+            if new_text:
+                loc = {"index": delete_start}
+                if tab_id:
+                    loc["tabId"] = tab_id
+                requests.append({"insertText": {"location": loc, "text": new_text}})
+            changed += 1
+    return requests, changed
+
+
+def _apply_requests(service, file_id, requests, required_revision):
+    """Apply a (possibly chunked) list of requests, pinned to required_revision,
+    and return the doc's revision id afterward for the next call to pin to.
+    """
+    if not requests:
+        return required_revision
+    CHUNK = 400
+    rev = required_revision
+    for i in range(0, len(requests), CHUNK):
+        _batch_update_with_revision(
+            service, file_id, requests[i:i + CHUNK], required_revision_id=rev,
+        )
+        rev = _revision_id(_fetch_doc_with_tabs(service, file_id))
+    return rev
+
+
+def _count_anchored_open_comments(drive_service, file_id: str):
+    """Return (open_comment_count, anchored_open_comment_count) for a file.
+
+    Used to warn before a destructive full-body replace-markdown, since the
+    Docs API cannot re-anchor a comment once its quoted text is gone.
+    """
+    open_count = 0
+    anchored_count = 0
+    page_token = None
+    try:
+        while True:
+            resp = (
+                drive_service.comments()
+                .list(
+                    fileId=file_id,
+                    fields="nextPageToken,comments(resolved,quotedFileContent)",
+                    pageSize=100,
+                    pageToken=page_token,
+                )
+                .execute()
+            )
+            for c in resp.get("comments", []) or []:
+                if c.get("resolved"):
+                    continue
+                open_count += 1
+                if (c.get("quotedFileContent") or {}).get("value"):
+                    anchored_count += 1
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+    except Exception as e:
+        logger.warning(
+            f"[_count_anchored_open_comments] could not list comments for {file_id}: {e}"
+        )
+        return 0, 0
+    return open_count, anchored_count
+
+
+def _replace_markdown_full(service, file_id, markdown_text, tab_id=None, dry_run=False):
+    """The historical replace-markdown behavior: clear the whole target, re-insert."""
+    blocks = parse_markdown(markdown_text)
+    counts = {
+        "blocks": len(blocks),
+        "headings": sum(1 for b in blocks if b["type"] == "heading"),
+        "paragraphs": sum(1 for b in blocks if b["type"] == "paragraph"),
+        "lists": sum(1 for b in blocks if b["type"] == "list"),
+        "quotes": sum(1 for b in blocks if b["type"] == "quote"),
+        "tables": sum(1 for b in blocks if b["type"] == "table"),
+        "hr_skipped": sum(1 for b in blocks if b["type"] == "hr"),
+    }
+    if dry_run:
+        return json.dumps({
+            "mode": "full_replace",
+            "dry_run": True,
+            "file_id": file_id,
+            "tab_id": tab_id,
+            **counts,
+        }, indent=2)
+    inner = insert_markdown(
+        service, file_id, markdown_text=markdown_text, tab_id=tab_id,
+        start_index=1, replace=True,
+    )
+    payload = json.loads(inner)
+    payload["mode"] = "full_replace"
+    payload["dry_run"] = False
+    return json.dumps(payload, indent=2)
+
+
+def _replace_markdown_preserving_comments(
+    service, file_id, markdown_text, tab_id=None, dry_run=False,
+):
+    """Diff-based replace-markdown: only touch paragraphs/tables that changed."""
+    doc = _fetch_doc_with_tabs(service, file_id)
+    revision_before = _revision_id(doc)
+    body_content = _get_body_content(doc, tab_id)
+    doc_last_end = _get_body_end_index(doc, tab_id)
+
+    old_items = _old_body_items(body_content)
+    blocks = parse_markdown(markdown_text)
+    new_items = _new_body_items(blocks)
+
+    old_keys = [it["key"] for it in old_items]
+    new_keys = [it["key"] for it in new_items]
+    opcodes = difflib.SequenceMatcher(None, old_keys, new_keys, autojunk=False).get_opcodes()
+
+    diff_preview = [
+        {
+            "op": tag,
+            "old_range": [i1, i2],
+            "new_range": [j1, j2],
+            "old_preview": [_truncate(it["key"], 60) for it in old_items[i1:i2]],
+            "new_preview": [_truncate(it["key"], 60) for it in new_items[j1:j2]],
+        }
+        for tag, i1, i2, j1, j2 in opcodes
+    ]
+    unchanged_count = sum((i2 - i1) for tag, i1, i2, _j1, _j2 in opcodes if tag == "equal")
+
+    if dry_run:
+        return json.dumps({
+            "mode": "preserve_comments",
+            "dry_run": True,
+            "file_id": file_id,
+            "tab_id": tab_id,
+            "old_paragraph_count": len(old_items),
+            "new_paragraph_count": len(new_items),
+            "unchanged_count": unchanged_count,
+            "diff": diff_preview,
+        }, indent=2)
+
+    applied: List[Dict[str, Any]] = []
+    required_revision = revision_before
+
+    # Walk opcodes back-to-front so edits never invalidate an index we still
+    # need for an earlier (not-yet-applied) opcode.
+    for tag, i1, i2, j1, j2 in reversed(opcodes):
+        if tag == "equal":
+            continue
+
+        # In-place cell rewrite for a single table replaced by a single
+        # same-shaped table -- keeps the table element (and any anchors
+        # inside it) instead of delete + re-insert.
+        if (
+            tag == "replace" and i2 - i1 == 1 and j2 - j1 == 1
+            and old_items[i1]["kind"] == "table" and new_items[j1]["kind"] == "table"
+        ):
+            old_matrix = old_items[i1]["matrix"]
+            new_matrix = new_items[j1]["matrix"]
+            old_dims = (len(old_matrix), len(old_matrix[0]) if old_matrix else 0)
+            new_dims = (len(new_matrix), len(new_matrix[0]) if new_matrix else 0)
+            if old_dims == new_dims and old_dims[0] > 0:
+                cell_reqs, changed_cells = _table_cell_rewrite_requests(
+                    old_items[i1]["element"], new_matrix, tab_id,
+                )
+                if cell_reqs:
+                    required_revision = _apply_requests(
+                        service, file_id, cell_reqs, required_revision,
+                    )
+                applied.append({
+                    "op": "table_rewrite_in_place",
+                    "table_start_index": old_items[i1]["start"],
+                    "changed_cells": changed_cells,
+                })
+                continue
+            # Dimensions differ -- fall through to delete + re-insert below.
+
+        # Range to delete (may be a zero-length insertion point).
+        if i1 < i2:
+            del_start = old_items[i1]["start"]
+            del_end = old_items[i2 - 1]["end"]
+        else:
+            del_start = old_items[i1]["start"] if i1 < len(old_items) else max(1, doc_last_end - 1)
+            del_end = del_start
+
+        # The body's final trailing newline can never be deleted.
+        if i2 >= len(old_items):
+            del_end = min(del_end, doc_last_end - 1)
+            del_start = min(del_start, del_end)
+
+        if del_end > del_start:
+            rng = {"startIndex": del_start, "endIndex": del_end}
+            if tab_id:
+                rng["tabId"] = tab_id
+            required_revision = _apply_requests(
+                service, file_id, [{"deleteContentRange": {"range": rng}}], required_revision,
+            )
+
+        cursor = del_start
+        pending: List[Dict[str, Any]] = []
+        for item in new_items[j1:j2]:
+            if item["kind"] == "table":
+                if pending:
+                    required_revision = _apply_requests(service, file_id, pending, required_revision)
+                    pending = []
+                cursor = _insert_markdown_table_block(service, file_id, item["block"], cursor, tab_id)
+                required_revision = _revision_id(_fetch_doc_with_tabs(service, file_id))
+                continue
+            new_type = item["new_type"]
+            if new_type == "heading":
+                item_reqs, cursor = build_heading_block(item["runs"], item["level"], cursor, tab_id)
+            elif new_type == "quote":
+                item_reqs, cursor = build_quote_block(item["runs"], cursor, tab_id)
+            elif new_type == "list_item":
+                item_reqs, cursor = build_list_block([item["runs"]], cursor, tab_id)
+            else:
+                item_reqs, cursor = build_paragraph_block(item["runs"], cursor, tab_id)
+            pending.extend(item_reqs)
+        if pending:
+            required_revision = _apply_requests(service, file_id, pending, required_revision)
+
+        applied.append({
+            "op": tag,
+            "old_range": [i1, i2],
+            "new_range": [j1, j2],
+            "deleted_range": [del_start, del_end] if del_end > del_start else None,
+            "inserted_items": j2 - j1,
+        })
+
+    revision_after = _revision_id(_fetch_doc_with_tabs(service, file_id))
+
+    return json.dumps({
+        "mode": "preserve_comments",
+        "dry_run": False,
+        "ok": True,
+        "file_id": file_id,
+        "title": doc.get("title"),
+        "tab_id": tab_id,
+        "revision_before": revision_before,
+        "revision_after": revision_after,
+        "old_paragraph_count": len(old_items),
+        "new_paragraph_count": len(new_items),
+        "unchanged_count": unchanged_count,
+        "applied_changes": list(reversed(applied)),
+    }, indent=2)
+
+
+def replace_markdown_doc(
+    service,
+    file_id: str = "",
+    markdown_text: str = "",
+    tab_id: str = None,
+    preserve_comments: bool = False,
+    dry_run: bool = False,
+    drive_service=None,
+) -> str:
+    """Replace a doc's body (or tab) with rendered markdown.
+
+    preserve_comments=False (default): clear the whole target and re-insert
+    the rendered markdown, same as the historical behavior. Fast, but any
+    comment anchored inside the cleared range detaches -- the Docs API
+    cannot re-anchor a comment once its quoted text is gone.
+
+    preserve_comments=True: diff the current body against the newly rendered
+    markdown at paragraph/table granularity and only touch what changed, so
+    comments anchored to unchanged text stay anchored. See
+    `_replace_markdown_preserving_comments` for the algorithm.
+
+    Either way, if the doc has open comments anchored to text, a warning is
+    always included in the returned JSON so callers can't miss the risk.
+    """
+    if not file_id:
+        return "Error: 'file_id' is required."
+    if markdown_text is None:
+        markdown_text = ""
+
+    open_comments = anchored_open = 0
+    if drive_service is not None:
+        open_comments, anchored_open = _count_anchored_open_comments(drive_service, file_id)
+
+    warnings: List[str] = []
+    if anchored_open and not preserve_comments:
+        warnings.append(
+            f"{anchored_open} of {open_comments} open comment(s) are anchored to text in "
+            "this doc. A full replace-markdown clears and re-inserts the body, and the Docs "
+            "API cannot re-anchor a comment once its quoted text is deleted -- these comments "
+            "will likely detach (still visible, no longer pinned to a location). Re-run with "
+            "--preserve-comments to keep matching text (and its anchors) untouched."
+        )
+    elif anchored_open and preserve_comments:
+        warnings.append(
+            f"{anchored_open} of {open_comments} open comment(s) are anchored to text in "
+            "this doc. Only paragraphs/tables whose text actually changed will be deleted and "
+            "re-inserted; comments anchored to unchanged text should remain anchored."
+        )
+
+    if preserve_comments:
+        result = _replace_markdown_preserving_comments(
+            service, file_id, markdown_text, tab_id=tab_id, dry_run=dry_run,
+        )
+    else:
+        result = _replace_markdown_full(
+            service, file_id, markdown_text, tab_id=tab_id, dry_run=dry_run,
+        )
+
+    payload = json.loads(result)
+    payload["warnings"] = warnings + payload.get("warnings", [])
+    payload["preserve_comments"] = preserve_comments
+    payload["open_comments"] = open_comments
+    payload["anchored_open_comments"] = anchored_open
+    return json.dumps(payload, indent=2)
 
 
 # ---------------------------------------------------------------------------

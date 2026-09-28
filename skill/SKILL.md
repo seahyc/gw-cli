@@ -147,6 +147,8 @@ gw docs create-table <file_id> --data JSON [--index N] [--bold-headers] [--tab-i
 gw docs insert-image <file_id> --url URL [--index N] [--width N] [--height N] [--tab-id ID]
 gw docs insert-list <file_id> --items JSON [--index N] [--ordered] [--tab-id ID]
 gw docs insert-markdown <file_id> --file PATH | --content STRING [--tab-id ID] [--index N] [--replace]
+gw docs append-markdown <file_id> --file PATH | --stdin | --content STRING [--tab-id ID] [--index N]
+gw docs replace-markdown <file_id> --file PATH | --stdin | --content STRING [--tab-id ID] [--preserve-comments] [--dry-run]
 gw docs insert-page-break <file_id> [--index N] [--tab-id ID]
 gw docs insert-section-break <file_id> [--index N] [--type NEXT_PAGE|CONTINUOUS] [--tab-id ID]
 gw docs insert-footnote <file_id> --index N --text TEXT [--tab-id ID]
@@ -232,6 +234,41 @@ tables (first row bolded), `**bold**`, `` `code` `` (Roboto Mono). Horizontal
 rules (`---`) are intentionally skipped — heading/paragraph spacing is
 sufficient. Not supported: nested/ordered lists, images, links, fenced code
 blocks, raw HTML.
+
+##### `replace-markdown` on docs with reviewer comments
+
+`gw docs replace-markdown` clears the target and re-inserts the rendered
+markdown. By **default** that's a full clear-and-reinsert: any comment
+anchored to text inside the cleared range detaches, because the Docs API has
+no way to re-anchor a comment once its quoted text has been deleted and
+recreated (the comment survives, but loses its pinned location).
+
+Pass `--preserve-comments` to avoid that on a doc with reviewer comments:
+
+```bash
+gw docs replace-markdown <file_id> --file ./brief.md --preserve-comments
+gw docs replace-markdown <file_id> --file ./brief.md --preserve-comments --dry-run
+```
+
+This reads the current body as a paragraph/table sequence, renders the new
+markdown into the same kind of sequence, and diffs the two with
+`difflib.SequenceMatcher` on normalized paragraph text. Only the
+paragraphs/tables that actually changed are deleted and re-inserted (from the
+end of the doc backwards, so earlier indices stay valid); everything that
+matches exactly is left untouched, so comments anchored to it stay anchored.
+A table whose dimensions are unchanged gets its changed cells rewritten in
+place (reusing the same logic as `table-write`) instead of being replaced
+outright. Use `--dry-run` first to see the planned diff (which
+paragraphs/tables are equal/replaced/inserted/deleted) without writing.
+
+Regardless of mode, if the doc has open (unresolved) comments anchored to
+text, the command's JSON output always includes a `warnings` entry telling
+you how many are at risk — read it before trusting a full replace on a
+shared draft.
+
+Known limitation: the diff key is normalized *text only* (not style), so a
+paragraph whose text is unchanged but whose formatting changed (e.g.
+promoted to a heading) is left as-is rather than restyled.
 
 #### Tables: inspect, write, set widths, preview wrapping
 
