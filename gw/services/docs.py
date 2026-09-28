@@ -14,6 +14,7 @@ import re
 from collections import Counter
 from typing import List, Dict, Any
 
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 from gw.services._helpers.docs_helpers import (
@@ -134,6 +135,10 @@ def _revision_id(doc: Dict[str, Any]) -> str:
     return doc.get("revisionId", "")
 
 
+class DocRevisionConflict(RuntimeError):
+    """Raised when a batchUpdate is rejected because the doc changed since it was read."""
+
+
 def _batch_update_with_revision(
     service,
     file_id: str,
@@ -141,24 +146,104 @@ def _batch_update_with_revision(
     *,
     required_revision_id: str = None,
 ):
-    """Apply Docs requests, pinning writes to the fetched revision when present."""
+    """Apply Docs requests, pinning writes to the fetched revision when present.
+
+    If the API rejects the write because the document's live revision no
+    longer matches `required_revision_id` (someone else -- or another gw
+    command -- wrote to the doc after it was read), raise a clear
+    DocRevisionConflict instead of letting a raw HttpError bubble up.
+    """
+    if not requests:
+        return {"replies": []}
     body = {"requests": requests}
     if required_revision_id:
         body["writeControl"] = {"requiredRevisionId": required_revision_id}
-    return (
-        service.documents()
-        .batchUpdate(documentId=file_id, body=body)
-        .execute()
-    )
+    try:
+        return (
+            service.documents()
+            .batchUpdate(documentId=file_id, body=body)
+            .execute()
+        )
+    except HttpError as e:
+        detail = ""
+        try:
+            detail = e.content.decode("utf-8", "replace") if e.content else str(e)
+        except Exception:
+            detail = str(e)
+        if required_revision_id and (
+            "revision" in detail.lower() or getattr(e, "status_code", None) == 409
+        ):
+            raise DocRevisionConflict(
+                "doc changed since read; re-read and retry "
+                f"(file_id={file_id}, required_revision_id={required_revision_id})"
+            ) from e
+        raise
 
 
 def _fetch_doc_with_tabs(service, file_id):
-    """Fetch a document with tabs content and revision metadata."""
+    """Fetch a document with tabs content, revision metadata, and inline
+    suggestions (so callers can detect pending-suggestion text without a
+    second round trip)."""
     return (
         service.documents()
-        .get(documentId=file_id, includeTabsContent=True)
+        .get(
+            documentId=file_id,
+            includeTabsContent=True,
+            suggestionsViewMode="SUGGESTIONS_INLINE",
+        )
         .execute()
     )
+
+
+def _paragraph_has_pending_suggestion(element) -> bool:
+    """True if any run inside this paragraph element carries a pending
+    suggested insertion/deletion (SUGGESTIONS_INLINE view mode)."""
+    paragraph = (element or {}).get("paragraph") or {}
+    for pe in paragraph.get("elements", []) or []:
+        tr = pe.get("textRun") or {}
+        if tr.get("suggestedInsertionIds") or tr.get("suggestedDeletionIds"):
+            return True
+        if pe.get("suggestedInsertionIds") or pe.get("suggestedDeletionIds"):
+            return True
+    if paragraph.get("suggestedParagraphStyleChanges"):
+        return True
+    return False
+
+
+def _doc_has_pending_suggestions(doc: Dict[str, Any]) -> bool:
+    """Scan every tab's body content for any paragraph with a pending suggestion."""
+    for tab_body in _iter_all_tab_bodies(doc):
+        for el in tab_body:
+            if "paragraph" in el and _paragraph_has_pending_suggestion(el):
+                return True
+            if "table" in el:
+                for row in el.get("table", {}).get("tableRows", []) or []:
+                    for cell in row.get("tableCells", []) or []:
+                        for cel in cell.get("content", []) or []:
+                            if "paragraph" in cel and _paragraph_has_pending_suggestion(cel):
+                                return True
+    return False
+
+
+def _iter_all_tab_bodies(doc: Dict[str, Any]):
+    """Yield the body content list for the main doc and every tab."""
+    body = doc.get("body")
+    if body:
+        yield body.get("content", []) or []
+
+    def walk(tabs):
+        for tab in tabs or []:
+            content = (
+                (tab.get("documentTab") or {}).get("body", {}).get("content", [])
+                or []
+            )
+            if content:
+                yield content
+            for sub in walk(tab.get("childTabs", []) or []):
+                yield sub
+
+    for content in walk(doc.get("tabs", []) or []):
+        yield content
 
 
 def _mutation_result(
@@ -1153,6 +1238,7 @@ def modify_doc_text(
     subscript: bool = None,
     link_url: str = None,
     tab_id: str = None,
+    dry_run: bool = False,
 ) -> str:
     """Insert/replace text and apply character formatting at a position in a Google Doc."""
     all_formatting = [bold, italic, underline, font_size, font_family, text_color,
@@ -1285,16 +1371,21 @@ def modify_doc_text(
             f"Applied formatting ({', '.join(format_details)}) to range {format_start}-{format_end}"
         )
 
-    _apply_tab_id(requests, tab_id)
-    (
-        service.documents()
-        .batchUpdate(documentId=file_id, body={"requests": requests})
-        .execute()
-    )
+    outcome = _guarded_batch_update(service, file_id, requests, tab_id=tab_id, dry_run=dry_run)
 
     operation_summary = "; ".join(operations)
     text_info = f" Text length: {len(text)} characters." if text else ""
-    return f"{operation_summary}.{text_info}"
+
+    if dry_run:
+        return json.dumps({
+            **outcome,
+            "planned_summary": f"{operation_summary}.{text_info}",
+        }, indent=2)
+
+    return (
+        f"{operation_summary}.{text_info} "
+        f"(revision {outcome['revision_before']} -> {outcome['revision_after']})"
+    )
 
 
 def find_and_replace_doc(
@@ -1745,6 +1836,7 @@ def insert_table(
     rows: int = 0,
     columns: int = 0,
     tab_id: str = None,
+    dry_run: bool = False,
 ) -> str:
     """Insert a table at the given index in a Google Doc."""
     logger.info(f"[insert_table] Doc={file_id}, index={index}, rows={rows}, columns={columns}, tab_id={tab_id}")
@@ -1756,15 +1848,18 @@ def insert_table(
         index = 1
 
     requests = [create_insert_table_request(index, rows, columns)]
-    _apply_tab_id(requests, tab_id)
+    outcome = _guarded_batch_update(service, file_id, requests, tab_id=tab_id, dry_run=dry_run)
 
-    (
-        service.documents()
-        .batchUpdate(documentId=file_id, body={"requests": requests})
-        .execute()
+    if dry_run:
+        return json.dumps({
+            **outcome,
+            "planned_summary": f"Would insert table ({rows}x{columns}) at index {index}.",
+        }, indent=2)
+
+    return (
+        f"Inserted table ({rows}x{columns}) at index {index}. "
+        f"(revision {outcome['revision_before']} -> {outcome['revision_after']})"
     )
-
-    return f"Inserted table ({rows}x{columns}) at index {index}."
 
 
 def insert_list(
@@ -1774,6 +1869,7 @@ def insert_list(
     list_type: str = "UNORDERED",
     text: str = "List item",
     tab_id: str = None,
+    dry_run: bool = False,
 ) -> str:
     """Insert a bullet or numbered list. list_type: UNORDERED or ORDERED."""
     logger.info(f"[insert_list] Doc={file_id}, index={index}, list_type={list_type}, tab_id={tab_id}")
@@ -1785,15 +1881,18 @@ def insert_list(
         create_insert_text_request(index, text + "\n"),
         create_bullet_list_request(index, index + len(text), list_type),
     ]
-    _apply_tab_id(requests, tab_id)
+    outcome = _guarded_batch_update(service, file_id, requests, tab_id=tab_id, dry_run=dry_run)
 
-    (
-        service.documents()
-        .batchUpdate(documentId=file_id, body={"requests": requests})
-        .execute()
+    if dry_run:
+        return json.dumps({
+            **outcome,
+            "planned_summary": f"Would insert {list_type.lower()} list at index {index}.",
+        }, indent=2)
+
+    return (
+        f"Inserted {list_type.lower()} list at index {index}. "
+        f"(revision {outcome['revision_before']} -> {outcome['revision_after']})"
     )
-
-    return f"Inserted {list_type.lower()} list at index {index}."
 
 
 def insert_page_break(service, file_id: str = "", index: int = 0, tab_id: str = None) -> str:
@@ -2004,6 +2103,7 @@ def create_table_with_data(
     index: int = 0,
     bold_headers: bool = True,
     tab_id: str = None,
+    dry_run: bool = False,
 ) -> str:
     """Create and populate a table in one operation."""
     logger.debug(f"[create_table_with_data] Doc={file_id}, index={index}")
@@ -2021,6 +2121,25 @@ def create_table_with_data(
     is_valid, error_msg = validator.validate_index(index, "Index")
     if not is_valid:
         return f"ERROR: {error_msg}"
+
+    if dry_run:
+        # create_and_populate_table is a multi-step insertTable -> refetch ->
+        # fill-cells dance (table cell indices aren't known until the table
+        # exists), so a byte-exact request list can't be computed up front.
+        # Report the validated plan and the doc's current revision instead.
+        doc = _fetch_doc_with_tabs(service, file_id)
+        rows = len(table_data)
+        cols = max((len(r) for r in table_data), default=0)
+        return json.dumps({
+            "dry_run": True,
+            "file_id": file_id,
+            "revision_before": _revision_id(doc),
+            "planned_summary": (
+                f"Would create a {rows}x{cols} table at index {index} "
+                f"(bold_headers={bold_headers}, tab_id={tab_id})."
+            ),
+            "table_data": table_data,
+        }, indent=2)
 
     table_manager = TableOperationManager(service)
 
@@ -2102,6 +2221,7 @@ def manage_table_structure(
     end_row: int = None,
     start_column: int = None,
     end_column: int = None,
+    dry_run: bool = False,
 ) -> str:
     """Modify table structure: insert/delete rows/columns, merge/unmerge cells."""
     logger.info(
@@ -2186,13 +2306,18 @@ def manage_table_structure(
         else:
             requests.append({"unmergeTableCells": {"tableRange": table_range}})
 
-    (
-        service.documents()
-        .batchUpdate(documentId=file_id, body={"requests": requests})
-        .execute()
-    )
+    outcome = _guarded_batch_update(service, file_id, requests, dry_run=dry_run)
 
-    return f"Performed '{action}' on table at index {table_start_index}."
+    if dry_run:
+        return json.dumps({
+            **outcome,
+            "planned_summary": f"Would perform '{action}' on table at index {table_start_index}.",
+        }, indent=2)
+
+    return (
+        f"Performed '{action}' on table at index {table_start_index}. "
+        f"(revision {outcome['revision_before']} -> {outcome['revision_after']})"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2212,6 +2337,7 @@ def update_paragraph_style(
     indent_first_line: float = None,
     indent_start: float = None,
     indent_end: float = None,
+    dry_run: bool = False,
 ) -> str:
     """Apply paragraph-level formatting to a range."""
     logger.info(
@@ -2266,14 +2392,20 @@ def update_paragraph_style(
         }
     }
 
-    (
-        service.documents()
-        .batchUpdate(documentId=file_id, body={"requests": [request]})
-        .execute()
-    )
+    outcome = _guarded_batch_update(service, file_id, [request], dry_run=dry_run)
 
     style_details = ", ".join(f"{f}={paragraph_style.get(f, paragraph_style.get(f))}" for f in fields)
-    return f"Applied paragraph style ({style_details}) to range {start_index}-{end_index}."
+
+    if dry_run:
+        return json.dumps({
+            **outcome,
+            "planned_summary": f"Would apply paragraph style ({style_details}) to range {start_index}-{end_index}.",
+        }, indent=2)
+
+    return (
+        f"Applied paragraph style ({style_details}) to range {start_index}-{end_index}. "
+        f"(revision {outcome['revision_before']} -> {outcome['revision_after']})"
+    )
 
 
 def update_document_style(
@@ -2516,6 +2648,7 @@ def batch_update_doc(
     file_id: str = "",
     operations: List[Dict[str, Any]] = None,
     tab_id: str = None,
+    dry_run: bool = False,
 ) -> str:
     """Execute multiple document operations in a single atomic batch."""
     logger.debug(f"[batch_update_doc] Doc={file_id}, operations={len(operations or [])}, tab_id={tab_id}")
@@ -2533,14 +2666,20 @@ def batch_update_doc(
     batch_manager = BatchOperationManager(service)
 
     ok, message, metadata = batch_manager.execute_batch_operations(
-        file_id, operations, tab_id=tab_id
+        file_id, operations, tab_id=tab_id, dry_run=dry_run,
     )
 
-    if ok:
-        replies_count = metadata.get("replies_count", 0)
-        return f"{message}. API replies: {replies_count}."
-    else:
+    if not ok:
         return f"Error: {message}"
+
+    if dry_run:
+        return json.dumps({**metadata, "message": message}, indent=2)
+
+    replies_count = metadata.get("replies_count", 0)
+    return (
+        f"{message}. API replies: {replies_count}. "
+        f"(revision {metadata.get('revision_before')} -> {metadata.get('revision_after')})"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2864,6 +3003,7 @@ def insert_markdown(
     tab_id: str = None,
     start_index: int = 1,
     replace: bool = False,
+    dry_run: bool = False,
 ) -> str:
     """Insert markdown content into a Google Doc as native formatting.
 
@@ -2913,13 +3053,12 @@ def insert_markdown(
         "hr_skipped": sum(1 for b in blocks if b["type"] == "hr"),
     }
 
+    doc = _fetch_doc_with_tabs(service, file_id)
+    required_revision = _revision_id(doc)
+
     # Step 1 (optional): clear existing content in the target.
+    clear_reqs: List[Dict[str, Any]] = []
     if replace:
-        doc = (
-            service.documents()
-            .get(documentId=file_id, includeTabsContent=True)
-            .execute()
-        )
         last_end = _get_body_end_index(doc, tab_id)
         # The body always ends with a final trailing newline that cannot be
         # deleted. Deletable range is [1, last_end - 1).
@@ -2941,9 +3080,6 @@ def insert_markdown(
                     }
                 },
             ]
-            service.documents().batchUpdate(
-                documentId=file_id, body={"requests": clear_reqs}
-            ).execute()
         cursor = 1
     else:
         cursor = max(1, int(start_index or 1))
@@ -2954,16 +3090,19 @@ def insert_markdown(
     # Google's batchUpdate hard cap is 500 requests per call; stay just under.
     CHUNK = 450
     pending: List[Dict[str, Any]] = []
+    planned_requests: List[Dict[str, Any]] = list(clear_reqs)
+    table_blocks_pending = 0
 
     def flush():
-        nonlocal pending
+        nonlocal pending, required_revision
         if not pending:
+            return
+        if dry_run:
+            pending = []
             return
         for i in range(0, len(pending), CHUNK):
             batch = pending[i:i + CHUNK]
-            service.documents().batchUpdate(
-                documentId=file_id, body={"requests": batch}
-            ).execute()
+            required_revision = _apply_requests(service, file_id, batch, required_revision)
         pending = []
 
     for block in blocks:
@@ -2973,24 +3112,63 @@ def insert_markdown(
                 block["runs"], block["level"], cursor, tab_id
             )
             pending.extend(reqs)
+            planned_requests.extend(reqs)
         elif btype == "paragraph":
             reqs, cursor = build_paragraph_block(block["runs"], cursor, tab_id)
             pending.extend(reqs)
+            planned_requests.extend(reqs)
         elif btype == "list":
             reqs, cursor = build_list_block(block["items_runs"], cursor, tab_id)
             pending.extend(reqs)
+            planned_requests.extend(reqs)
         elif btype == "quote":
             reqs, cursor = build_quote_block(block["runs"], cursor, tab_id)
             pending.extend(reqs)
+            planned_requests.extend(reqs)
         elif btype == "hr":
             # Skip horizontal rules -- heading/paragraph separation is enough.
             continue
         elif btype == "table":
             # Flush text-based requests first so cursor positions stay valid.
             flush()
-            cursor = _insert_markdown_table_block(service, file_id, block, cursor, tab_id)
+            if dry_run:
+                # A table's cell-fill requests can't be computed without an
+                # insertTable round trip to learn real cell indices; report
+                # its position and move the preview cursor past an estimate.
+                table_blocks_pending += 1
+                n_rows = len(block["rows"])
+                n_cols = max((len(r) for r in block["rows"]), default=0)
+                planned_requests.append({
+                    "insertTable (planned, indices resolved at write time)": {
+                        "location": {"index": cursor, **({"tabId": tab_id} if tab_id else {})},
+                        "rows": n_rows,
+                        "columns": n_cols,
+                    }
+                })
+                cursor += 2  # placeholder advance; not used for further planning precision
+            else:
+                cursor = _insert_markdown_table_block(
+                    service, file_id, block, cursor, tab_id,
+                )
+                required_revision = _revision_id(_fetch_doc_with_tabs(service, file_id))
 
     flush()
+
+    if dry_run:
+        return json.dumps({
+            "dry_run": True,
+            "file_id": file_id,
+            "tab_id": tab_id,
+            "revision_before": required_revision,
+            "replace": replace,
+            "start_index": start_index if not replace else 1,
+            "requests": planned_requests,
+            "note": (
+                "table blocks show a planned insertTable only; their cell-fill "
+                "requests are resolved from live cell indices at write time"
+            ) if table_blocks_pending else None,
+            **counts,
+        }, indent=2)
 
     return json.dumps({
         "inserted": True,
@@ -2998,6 +3176,7 @@ def insert_markdown(
         "tab_id": tab_id,
         "replaced": replace,
         "start_index": start_index if not replace else 1,
+        "revision_after": required_revision,
         **counts,
     }, indent=2)
 
@@ -3048,6 +3227,7 @@ def _old_body_items(body_content: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "start": el.get("startIndex"),
                 "end": el.get("endIndex"),
                 "element": el,
+                "has_suggestion": _paragraph_has_pending_suggestion(el),
             })
         elif "table" in el:
             matrix = _table_matrix(el)
@@ -3058,6 +3238,7 @@ def _old_body_items(body_content: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "end": el.get("endIndex"),
                 "element": el,
                 "matrix": matrix,
+                "has_suggestion": False,
             })
     return items
 
@@ -3160,6 +3341,45 @@ def _apply_requests(service, file_id, requests, required_revision):
     return rev
 
 
+def _guarded_batch_update(
+    service, file_id, requests, *, tab_id=None, dry_run=False, doc=None,
+):
+    """Shared write path for simple (single-shot) Docs mutations.
+
+    Applies tabId to each request, fetches the doc's current revision (or
+    reuses one already fetched by the caller), and either:
+      - dry_run=True: returns a preview dict with the exact requests and
+        the doc's current revision, without writing;
+      - dry_run=False: issues the batchUpdate pinned to that revision (via
+        `_batch_update_with_revision`, which raises DocRevisionConflict with
+        a clear message on a stale revision) and returns the outcome
+        including revision_before/after.
+    """
+    _apply_tab_id(requests, tab_id)
+    if doc is None:
+        doc = _fetch_doc_with_tabs(service, file_id)
+    revision_before = _revision_id(doc)
+    if dry_run:
+        return {
+            "dry_run": True,
+            "file_id": file_id,
+            "revision_before": revision_before,
+            "requests": requests,
+        }
+    result = _batch_update_with_revision(
+        service, file_id, requests, required_revision_id=revision_before,
+    )
+    revision_after = _revision_id(_fetch_doc_with_tabs(service, file_id))
+    return {
+        "dry_run": False,
+        "file_id": file_id,
+        "revision_before": revision_before,
+        "revision_after": revision_after,
+        "requests": requests,
+        "result": result,
+    }
+
+
 def _count_anchored_open_comments(drive_service, file_id: str):
     """Return (open_comment_count, anchored_open_comment_count) for a file.
 
@@ -3245,6 +3465,9 @@ def _replace_markdown_preserving_comments(
     new_keys = [it["key"] for it in new_items]
     opcodes = difflib.SequenceMatcher(None, old_keys, new_keys, autojunk=False).get_opcodes()
 
+    def _opcode_has_suggestion(i1, i2):
+        return any(old_items[k].get("has_suggestion") for k in range(i1, i2))
+
     diff_preview = [
         {
             "op": tag,
@@ -3252,6 +3475,7 @@ def _replace_markdown_preserving_comments(
             "new_range": [j1, j2],
             "old_preview": [_truncate(it["key"], 60) for it in old_items[i1:i2]],
             "new_preview": [_truncate(it["key"], 60) for it in new_items[j1:j2]],
+            "skipped_pending_suggestion": tag != "equal" and _opcode_has_suggestion(i1, i2),
         }
         for tag, i1, i2, j1, j2 in opcodes
     ]
@@ -3270,12 +3494,27 @@ def _replace_markdown_preserving_comments(
         }, indent=2)
 
     applied: List[Dict[str, Any]] = []
+    skipped_suggestions: List[Dict[str, Any]] = []
     required_revision = revision_before
 
     # Walk opcodes back-to-front so edits never invalidate an index we still
     # need for an earlier (not-yet-applied) opcode.
     for tag, i1, i2, j1, j2 in reversed(opcodes):
         if tag == "equal":
+            continue
+
+        # Never touch a changed paragraph that contains a pending suggestion
+        # (SUGGESTIONS_INLINE textRun.suggestedInsertionIds/suggestedDeletionIds):
+        # deleting it would silently discard someone's pending edit. Leave the
+        # whole changed block untouched and report it instead.
+        if _opcode_has_suggestion(i1, i2):
+            skipped_suggestions.append({
+                "op": tag,
+                "old_range": [i1, i2],
+                "new_range": [j1, j2],
+                "old_preview": [_truncate(it["key"], 80) for it in old_items[i1:i2]],
+                "reason": "paragraph contains a pending suggestion; left unmodified",
+            })
             continue
 
         # In-place cell rewrite for a single table replaced by a single
@@ -3372,7 +3611,32 @@ def _replace_markdown_preserving_comments(
         "new_paragraph_count": len(new_items),
         "unchanged_count": unchanged_count,
         "applied_changes": list(reversed(applied)),
+        "skipped_pending_suggestions": list(reversed(skipped_suggestions)),
     }, indent=2)
+
+
+def _current_user_email(drive_service) -> str:
+    """Best-effort email of the authenticated Drive identity."""
+    try:
+        about = drive_service.about().get(fields="user(emailAddress)").execute()
+        return ((about.get("user") or {}).get("emailAddress") or "").lower()
+    except Exception as e:
+        logger.warning(f"[_current_user_email] could not resolve identity: {e}")
+        return ""
+
+
+def _last_modifying_user_email(drive_service, file_id: str) -> str:
+    """Email of the Drive file's lastModifyingUser, or '' if unknown."""
+    try:
+        meta = (
+            drive_service.files()
+            .get(fileId=file_id, fields="lastModifyingUser")
+            .execute()
+        )
+        return ((meta.get("lastModifyingUser") or {}).get("emailAddress") or "").lower()
+    except Exception as e:
+        logger.warning(f"[_last_modifying_user_email] could not read {file_id}: {e}")
+        return ""
 
 
 def replace_markdown_doc(
@@ -3380,42 +3644,73 @@ def replace_markdown_doc(
     file_id: str = "",
     markdown_text: str = "",
     tab_id: str = None,
-    preserve_comments: bool = False,
+    force_full: bool = False,
+    yes: bool = False,
     dry_run: bool = False,
     drive_service=None,
 ) -> str:
     """Replace a doc's body (or tab) with rendered markdown.
 
-    preserve_comments=False (default): clear the whole target and re-insert
-    the rendered markdown, same as the historical behavior. Fast, but any
-    comment anchored inside the cleared range detaches -- the Docs API
-    cannot re-anchor a comment once its quoted text is gone.
-
-    preserve_comments=True: diff the current body against the newly rendered
-    markdown at paragraph/table granularity and only touch what changed, so
-    comments anchored to unchanged text stay anchored. See
+    Default (force_full=False): diff the current body against the newly
+    rendered markdown at paragraph/table granularity and only touch what
+    changed, so comments anchored to unchanged text -- and paragraphs
+    carrying a pending suggestion -- stay untouched. See
     `_replace_markdown_preserving_comments` for the algorithm.
 
-    Either way, if the doc has open comments anchored to text, a warning is
-    always included in the returned JSON so callers can't miss the risk.
+    force_full=True: clear the whole target and re-insert the rendered
+    markdown, the historical (and destructive) behavior. Any comment
+    anchored inside the cleared range detaches -- the Docs API cannot
+    re-anchor a comment once its quoted text is gone -- and any pending
+    suggestion inside the cleared range is discarded outright. Because of
+    that blast radius, force_full additionally requires yes=True whenever
+    the doc has unresolved comments anchored to text, pending suggestions,
+    or was last modified by someone other than the authenticated user;
+    without yes=True it raises ValueError describing what was detected.
     """
     if not file_id:
         return "Error: 'file_id' is required."
     if markdown_text is None:
         markdown_text = ""
 
+    preserve_comments = not force_full
+
     open_comments = anchored_open = 0
     if drive_service is not None:
         open_comments, anchored_open = _count_anchored_open_comments(drive_service, file_id)
 
     warnings: List[str] = []
-    if anchored_open and not preserve_comments:
+
+    if force_full and not dry_run and not yes:
+        reasons: List[str] = []
+        if anchored_open:
+            reasons.append(
+                f"{anchored_open} of {open_comments} open comment(s) are anchored to text"
+            )
+        doc_check = _fetch_doc_with_tabs(service, file_id)
+        if _doc_has_pending_suggestions(doc_check):
+            reasons.append("the doc has pending (unaccepted) suggestions")
+        if drive_service is not None:
+            me = _current_user_email(drive_service)
+            last_mod = _last_modifying_user_email(drive_service, file_id)
+            if me and last_mod and me != last_mod:
+                reasons.append(f"the doc was last modified by {last_mod}, not you")
+        if reasons:
+            raise ValueError(
+                "--force-full refused: " + "; ".join(reasons) + ". "
+                "A full replace clears the whole target and re-inserts markdown, which "
+                "detaches comment anchors and discards pending suggestions inside the "
+                "cleared range. Re-run with --yes to override, or drop --force-full to "
+                "use the default surgical (comment- and suggestion-preserving) mode."
+            )
+
+    if anchored_open and force_full:
         warnings.append(
             f"{anchored_open} of {open_comments} open comment(s) are anchored to text in "
             "this doc. A full replace-markdown clears and re-inserts the body, and the Docs "
             "API cannot re-anchor a comment once its quoted text is deleted -- these comments "
-            "will likely detach (still visible, no longer pinned to a location). Re-run with "
-            "--preserve-comments to keep matching text (and its anchors) untouched."
+            "will likely detach (still visible, no longer pinned to a location). Drop "
+            "--force-full to use the default surgical mode, which keeps matching text (and "
+            "its anchors) untouched."
         )
     elif anchored_open and preserve_comments:
         warnings.append(
@@ -3435,6 +3730,7 @@ def replace_markdown_doc(
 
     payload = json.loads(result)
     payload["warnings"] = warnings + payload.get("warnings", [])
+    payload["force_full"] = force_full
     payload["preserve_comments"] = preserve_comments
     payload["open_comments"] = open_comments
     payload["anchored_open_comments"] = anchored_open

@@ -41,7 +41,11 @@ class BatchOperationManager:
         self.service = service
 
     def execute_batch_operations(
-        self, document_id: str, operations: list[dict[str, Any]], tab_id: str = None
+        self,
+        document_id: str,
+        operations: list[dict[str, Any]],
+        tab_id: str = None,
+        dry_run: bool = False,
     ) -> tuple[bool, str, dict[str, Any]]:
         """
         Execute multiple document operations in a single atomic batch.
@@ -79,18 +83,33 @@ class BatchOperationManager:
                 from gw.services.docs import _apply_tab_id
                 _apply_tab_id(requests, tab_id)
 
-            # Execute the batch
-            result = self._execute_batch_requests(document_id, requests)
+            # Execute the batch (or preview it, revision-guarded either way)
+            from gw.services.docs import _guarded_batch_update
+            outcome = _guarded_batch_update(
+                self.service, document_id, requests, dry_run=dry_run,
+            )
+            result = outcome.get("result", {})
+
+            summary = self._build_operation_summary(operation_descriptions)
 
             # Process results
             metadata = {
                 "operations_count": len(operations),
                 "requests_count": len(requests),
-                "replies_count": len(result.get("replies", [])),
+                "replies_count": len(result.get("replies", [])) if not dry_run else 0,
                 "operation_summary": operation_descriptions[:5],  # First 5 operations
+                "dry_run": dry_run,
+                "revision_before": outcome.get("revision_before"),
+                "revision_after": outcome.get("revision_after"),
+                "requests": requests,
             }
 
-            summary = self._build_operation_summary(operation_descriptions)
+            if dry_run:
+                return (
+                    True,
+                    f"Would execute {len(operations)} operations ({summary})",
+                    metadata,
+                )
 
             return (
                 True,

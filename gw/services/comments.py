@@ -165,7 +165,8 @@ def read_comments(service, file_id: str) -> str:
 
 
 def create_comment(
-    service, file_id: str, content: str, quoted_text: str = "", docs_service=None
+    service, file_id: str, content: str, quoted_text: str = "", docs_service=None,
+    dry_run: bool = False,
 ) -> str:
     """Create a new comment on a Google Workspace file.
 
@@ -176,6 +177,7 @@ def create_comment(
 
     body = {"content": content}
     anchor_resolved = False
+    start_index = text_length = total_length = None
 
     if quoted_text:
         body["quotedFileContent"] = {
@@ -201,6 +203,15 @@ def create_comment(
                     f"'{quoted_text[:50]}...' in document {file_id}. "
                     f"Comment will be created without a text anchor."
                 )
+
+    if dry_run:
+        return json.dumps({
+            "dry_run": True,
+            "file_id": file_id,
+            "planned_body": body,
+            "anchor_resolved": anchor_resolved,
+            "anchor_offset": start_index,
+        }, indent=2)
 
     comment = (
         service.comments()

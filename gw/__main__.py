@@ -10,7 +10,7 @@ from pathlib import Path
 import shutil
 import sys
 
-from gw.cli import gmail, drive, docs, sheets, calendar, forms, slides, comments
+from gw.cli import gmail, drive, docs, sheets, calendar, forms, slides, comments, api
 from gw import throttle
 
 
@@ -54,6 +54,23 @@ def _gws_env():
             "GOOGLE_WORKSPACE_CLI_CLIENT_SECRET",
             env["GOOGLE_OAUTH_CLIENT_SECRET"],
         )
+
+    # `gw api ...` now uses gw's own Keychain credentials natively (see
+    # gw/cli/api.py) and no longer execs gws. This function only remains for
+    # the explicit `gw gws ...` escape hatch to the external gws binary,
+    # which keeps its own separate credential store and can hit invalid_grant
+    # even when gw itself is authenticated. Pass gw's current access token
+    # through in case that path is configured to accept one directly.
+    try:
+        from gw.auth import get_credentials
+
+        credentials, _ = get_credentials()
+        if credentials and credentials.token:
+            env.setdefault("GOOGLE_OAUTH_ACCESS_TOKEN", credentials.token)
+            env.setdefault("GWS_ACCESS_TOKEN", credentials.token)
+    except Exception:
+        pass  # best-effort; gws falls back to its own auth if this fails
+
     return env
 
 
@@ -80,8 +97,12 @@ def _should_delegate_to_gws(argv, root_choices):
         return False
 
     service = argv[0]
-    if service in {"api", "gws"}:
+    if service == "gws":
         return True
+    if service == "api":
+        # 'api' is now a native gw command (see gw/cli/api.py): it uses gw's
+        # own Keychain credentials instead of gws' separate credential store.
+        return False
     if service.startswith("-"):
         return False
     if service not in root_choices:
@@ -121,10 +142,6 @@ def main():
     )
     auth_sub.add_parser("status", help="Show authentication status")
     auth_sub.add_parser("logout", help="Remove stored credentials")
-    subparsers.add_parser(
-        "api",
-        help="Raw Google API passthrough: gw api <service> <resource> ...",
-    )
 
     # Register all service CLIs
     gmail.register(subparsers)
@@ -135,6 +152,7 @@ def main():
     forms.register(subparsers)
     slides.register(subparsers)
     comments.register(subparsers)
+    api.register(subparsers)
 
     argv = sys.argv[1:]
     root_choices = _subparser_choices(parser)

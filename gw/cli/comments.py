@@ -28,6 +28,7 @@ def register(subparsers):
         "--service", choices=["docs"], default=None, dest="anchor_service",
         help="Use docs service for text anchoring",
     )
+    p_create.add_argument("--dry-run", action="store_true", help="Preview without writing")
 
     # comments reply
     p_reply = sub.add_parser("reply", help="Reply to a comment")
@@ -104,6 +105,7 @@ def cmd_create(args):
             args.content,
             quoted_text=args.quoted_text or "",
             docs_service=docs_service,
+            dry_run=args.dry_run,
         )
         success(result)
     except Exception as e:

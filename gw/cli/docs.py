@@ -125,7 +125,7 @@ def cmd_insert_text(args):
         service = get_service("docs")
         result = docs.modify_doc_text(
             service, args.file_id, start_index=args.index, text=args.text,
-            tab_id=args.tab_id,
+            tab_id=args.tab_id, dry_run=args.dry_run,
         )
         success(result)
     except Exception as e:
@@ -137,7 +137,7 @@ def cmd_insert_table(args):
         service = get_service("docs")
         result = docs.insert_table(
             service, args.file_id, index=args.index, rows=args.rows, columns=args.cols,
-            tab_id=args.tab_id,
+            tab_id=args.tab_id, dry_run=args.dry_run,
         )
         success(result)
     except Exception as e:
@@ -151,7 +151,7 @@ def cmd_create_table(args):
         result = docs.create_table_with_data(
             service, args.file_id, table_data=table_data,
             index=args.index, bold_headers=args.bold_headers,
-            tab_id=args.tab_id,
+            tab_id=args.tab_id, dry_run=args.dry_run,
         )
         success(result)
     except json.JSONDecodeError as e:
@@ -183,7 +183,7 @@ def cmd_insert_list(args):
         result = docs.insert_list(
             service, args.file_id, index=args.index,
             list_type=list_type, text=text,
-            tab_id=args.tab_id,
+            tab_id=args.tab_id, dry_run=args.dry_run,
         )
         success(result)
     except json.JSONDecodeError as e:
@@ -246,6 +246,7 @@ def cmd_update_paragraph_style(args):
             line_spacing=args.line_spacing, space_above=args.space_above,
             space_below=args.space_below, indent_first_line=args.indent_first_line,
             indent_start=args.indent_start, indent_end=args.indent_end,
+            dry_run=args.dry_run,
         )
         success(result)
     except Exception as e:
@@ -291,6 +292,7 @@ def cmd_manage_table(args):
             insert_below=args.insert_below, insert_right=args.insert_right,
             start_row=args.start_row, end_row=args.end_row,
             start_column=args.start_column, end_column=args.end_column,
+            dry_run=args.dry_run,
         )
         success(result)
     except Exception as e:
@@ -312,6 +314,7 @@ def cmd_batch_update(args):
         operations = json.loads(args.requests)
         result = docs.batch_update_doc(
             service, args.file_id, operations=operations, tab_id=args.tab_id,
+            dry_run=args.dry_run,
         )
         success(result)
     except json.JSONDecodeError as e:
@@ -381,6 +384,7 @@ def cmd_insert_markdown(args):
             tab_id=args.tab_id,
             start_index=args.index,
             replace=args.replace,
+            dry_run=args.dry_run,
         )
         success(result)
     except FileNotFoundError as e:
@@ -432,6 +436,7 @@ def cmd_append_markdown(args):
             tab_id=args.tab_id,
             start_index=start_index,
             replace=False,
+            dry_run=args.dry_run,
         )
         success(result)
     except FileNotFoundError as e:
@@ -445,12 +450,15 @@ def cmd_append_markdown(args):
 def cmd_replace_markdown(args):
     """Replace the doc body (or target tab) with markdown.
 
-    By default this clears the whole target and re-inserts the rendered
-    markdown (fast, but detaches any comment anchored inside the cleared
-    range -- the Docs API cannot re-anchor a comment once its quoted text
-    is gone). Pass --preserve-comments to instead diff the current body
-    against the new markdown at paragraph/table granularity and only touch
-    what actually changed, so comments anchored to unchanged text survive.
+    By default (surgical mode) this diffs the current body against the new
+    markdown at paragraph/table granularity and only touches what actually
+    changed, so comments anchored to unchanged text -- and paragraphs
+    carrying a pending suggestion -- survive. Pass --force-full to instead
+    clear the whole target and re-insert the rendered markdown (fast, but
+    detaches anchored comments and discards pending suggestions inside the
+    cleared range); --force-full additionally requires --yes whenever the
+    doc has unresolved anchored comments, pending suggestions, or was last
+    modified by someone other than you.
     """
     try:
         drive_service, service = get_services("drive", "docs")
@@ -460,7 +468,8 @@ def cmd_replace_markdown(args):
             args.file_id,
             markdown_text=md_text,
             tab_id=args.tab_id,
-            preserve_comments=args.preserve_comments,
+            force_full=args.force_full,
+            yes=args.yes,
             dry_run=args.dry_run,
             drive_service=drive_service,
         )
@@ -708,6 +717,7 @@ def register(subparsers):
     p.add_argument("--text", required=True, help="Text to insert")
     p.add_argument("--index", type=int, default=0, help="Insertion index (default: 0)")
     p.add_argument("--tab-id", help="If set, insert into this tab instead of the default tab")
+    p.add_argument("--dry-run", action="store_true", help="Preview without writing")
     p.set_defaults(func=cmd_insert_text)
 
     # insert-table
@@ -717,6 +727,7 @@ def register(subparsers):
     p.add_argument("--cols", type=int, required=True, help="Number of columns")
     p.add_argument("--index", type=int, default=0, help="Insertion index")
     p.add_argument("--tab-id", help="If set, insert into this tab instead of the default tab")
+    p.add_argument("--dry-run", action="store_true", help="Preview without writing")
     p.set_defaults(func=cmd_insert_table)
 
     # create-table (with data)
@@ -726,6 +737,7 @@ def register(subparsers):
     p.add_argument("--index", type=int, default=0, help="Insertion index")
     p.add_argument("--bold-headers", action="store_true", default=True, help="Bold the first row (default: true)")
     p.add_argument("--tab-id", help="If set, insert into this tab instead of the default tab")
+    p.add_argument("--dry-run", action="store_true", help="Preview without writing")
     p.set_defaults(func=cmd_create_table)
 
     # insert-image
@@ -745,6 +757,7 @@ def register(subparsers):
     p.add_argument("--index", type=int, default=0, help="Insertion index")
     p.add_argument("--ordered", action="store_true", help="Numbered list instead of bullets")
     p.add_argument("--tab-id", help="If set, insert into this tab instead of the default tab")
+    p.add_argument("--dry-run", action="store_true", help="Preview without writing")
     p.set_defaults(func=cmd_insert_list)
 
     # insert-page-break
@@ -789,6 +802,7 @@ def register(subparsers):
     p.add_argument("--indent-first-line", type=float, help="First-line indent (pt)")
     p.add_argument("--indent-start", type=float, help="Start indent (pt)")
     p.add_argument("--indent-end", type=float, help="End indent (pt)")
+    p.add_argument("--dry-run", action="store_true", help="Preview without writing")
     p.set_defaults(func=cmd_update_paragraph_style)
 
     # update-document-style
@@ -828,6 +842,7 @@ def register(subparsers):
     p.add_argument("--end-row", type=int, help="End row for merge/unmerge")
     p.add_argument("--start-column", type=int, help="Start column for merge/unmerge")
     p.add_argument("--end-column", type=int, help="End column for merge/unmerge")
+    p.add_argument("--dry-run", action="store_true", help="Preview without writing")
     p.set_defaults(func=cmd_manage_table)
 
     # debug-table
@@ -841,6 +856,7 @@ def register(subparsers):
     p.add_argument("file_id", help="Document ID")
     p.add_argument("--requests", required=True, help="JSON array of operation objects")
     p.add_argument("--tab-id", help="If set, scope all operations to this tab")
+    p.add_argument("--dry-run", action="store_true", help="Preview without writing")
     p.set_defaults(func=cmd_batch_update)
 
     # header-footer
@@ -887,6 +903,7 @@ def register(subparsers):
         "--replace", action="store_true",
         help="Clear all existing content in the target (tab or whole doc) before inserting",
     )
+    p.add_argument("--dry-run", action="store_true", help="Preview without writing")
     p.set_defaults(func=cmd_insert_markdown)
 
     # append-markdown
@@ -903,6 +920,7 @@ def register(subparsers):
         "--index", type=int, default=None,
         help="Override insertion index. If omitted, auto-discovers end of body.",
     )
+    p.add_argument("--dry-run", action="store_true", help="Preview without writing")
     p.set_defaults(func=cmd_append_markdown)
 
     # replace-markdown
@@ -916,19 +934,25 @@ def register(subparsers):
     p.add_argument("--content", help="Markdown content as a string")
     p.add_argument("--tab-id", help="If set, target this tab instead of the default body")
     p.add_argument(
-        "--preserve-comments",
+        "--force-full",
         action="store_true",
         help=(
-            "Diff the current body against the new markdown at paragraph/table "
-            "granularity and only delete/insert what changed, so comments anchored "
-            "to unchanged text stay anchored. Without this flag, the whole target "
-            "is cleared and re-inserted (any anchored comment inside it detaches)."
+            "Clear the whole target and re-insert markdown instead of the default "
+            "surgical (paragraph/table diff) mode. Any comment anchored inside the "
+            "cleared range detaches and any pending suggestion inside it is discarded. "
+            "Requires --yes if the doc has unresolved anchored comments, pending "
+            "suggestions, or was last modified by someone other than you."
         ),
+    )
+    p.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm --force-full despite unresolved comments/suggestions/other last editor",
     )
     p.add_argument(
         "--dry-run",
         action="store_true",
-        help="Preview the planned change (paragraph diff in --preserve-comments mode) without writing",
+        help="Preview the planned change (paragraph diff in surgical mode) without writing",
     )
     p.set_defaults(func=cmd_replace_markdown)
 

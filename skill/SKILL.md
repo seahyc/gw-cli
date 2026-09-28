@@ -11,28 +11,32 @@ Command pattern: `gw <service> <action> [args]`
 
 Native services: `auth`, `gmail`, `drive`, `docs`, `sheets`, `calendar`, `forms`, `slides`, `comments`
 
-`gw` also has a raw API passthrough layer for full Google Discovery API
-coverage. Use native `gw` commands first when they exist; for anything
-missing, use `gw api`:
+`gw` also has a raw API passthrough for full Google Discovery API coverage.
+Use native `gw` commands first when they exist; for anything missing, use
+`gw api`:
 
 ```bash
-gw api <service> <resource> [sub-resource] <method> [flags]
-gw api schema <service.resource.method>
+gw api <service> <resource> <method> [--version VER] [--params JSON] [--body JSON] [--dry-run]
 
-# Explicit passthrough examples
+# Examples
 gw api drive files list --params '{"pageSize": 10}'
-gw api schema drive.files.list
-gw api sheets spreadsheets values get --params '{"spreadsheetId": "...", "range": "Sheet1!A1:D10"}'
-gw api people people get --params '{"resourceName": "people/me", "personFields": "names,emailAddresses"}'
-
-# Transparent passthrough also works when native gw has no matching command
-gw drive files list --params '{"pageSize": 10}'
-gw sheets spreadsheets values get --params '{"spreadsheetId": "...", "range": "Sheet1!A1:D10"}'
-gw people people get --params '{"resourceName": "people/me", "personFields": "names,emailAddresses"}'
+gw api drive comments list --params '{"fileId": "...", "fields": "comments(id,content,anchor)"}'
+gw api sheets spreadsheets.values get --params '{"spreadsheetId": "...", "range": "Sheet1!A1:D10"}'
+gw api drive files update --params '{"fileId": "..."}' --body '{"trashed": true}'
 ```
 
-`gw gws ...` is available as a compatibility alias, but `gw api ...` is the
-public interface.
+`<resource>` is a dot-separated Discovery resource path (e.g. `files`,
+`comments.replies`, `spreadsheets.values`); `--body` is shorthand for a
+`body` key inside `--params`.
+
+`gw api` uses gw's own Keychain credentials (the same `google.oauth2`
+credentials every native `gw <service> ...` command uses) via
+`googleapiclient.discovery`, so it works in any environment where native
+`gw` commands already work -- no separate login. It does **not** exec the
+external `gws` binary. `gw gws ...` still delegates to that binary if it's
+installed separately (its own, separate credential store), for any surface
+`gw api`/native commands don't cover; gw passes its own current access token
+through in the environment in case that path can use it directly.
 
 Passthrough adds coverage for services and methods not implemented natively in
 `gw`, including `people`, `chat`, `classroom`, `keep`, `meet`, `tasks`,
@@ -130,6 +134,45 @@ gw drive share <file_id> --email colleague@company.com --role writer
 
 ### Docs
 
+#### Editing shared docs
+
+- **Read first, with suggestions.** `gw docs read`/`inspect` fetch the doc
+  with `suggestionsViewMode=SUGGESTIONS_INLINE`, so pending (unaccepted)
+  suggestions are visible in the response rather than silently hidden.
+  Check for them before editing a doc someone else might be actively
+  reviewing.
+- **Dry-run first.** Every Docs write command (`edit`, `replace-markdown`,
+  `append-markdown`, `insert-markdown`, `insert-text`, `insert-list`,
+  `insert-table`, `create-table`, `table-write`, `manage-table`,
+  `batch-update`, `update-paragraph-style`) and `comments create` accept
+  `--dry-run`. It reads the doc, computes the exact requests (or, where an
+  API round trip is unavoidable to learn live indices — table cell fills —
+  the closest faithful preview), and prints them plus the current revision
+  without writing anything.
+- **Surgical by default.** `gw docs replace-markdown` diffs the current body
+  against the new markdown at paragraph/table granularity and only
+  deletes/re-inserts what actually changed, so comments anchored to
+  unchanged text stay anchored. A changed paragraph that contains a pending
+  suggestion is left untouched and reported in
+  `skipped_pending_suggestions` rather than silently overwritten.
+- **Revision guard.** Every batchUpdate gw issues is pinned to the
+  `revisionId` from the same `documents.get` that computed its indices via
+  `writeControl.requiredRevisionId`. If the doc changed since that read, the
+  write fails fast with `doc changed since read; re-read and retry` instead
+  of silently clobbering someone else's edit.
+- **Overriding surgical mode.** Pass `--force-full` to fall back to the old
+  clear-and-reinsert behavior. If the doc has unresolved comments anchored to
+  text, pending suggestions, or was last modified by someone other than you,
+  `--force-full` additionally requires `--yes` (it refuses and explains why
+  otherwise).
+- **`gw api` auth.** `gw api <service> <resource> <method>` uses gw's own
+  Keychain credentials (the same ones every native `gw docs ...` command
+  uses) via Discovery, not the separate `gws` binary's credential store. It
+  works in any environment where native `gw` commands already work; no
+  extra login step. `gw gws ...` still delegates to the external `gws`
+  binary if it's installed separately, for anything `gw api`/native commands
+  don't cover.
+
 ```bash
 gw docs read <file_id> [--tab-id ID]
 gw docs list-tabs <file_id>
@@ -141,28 +184,28 @@ gw docs search <query> [--max-results N]
 gw docs list-in-folder [--folder-id ID] [--max-results N]
 gw docs create --title TITLE [--content TEXT]
 gw docs edit <file_id> --find TEXT --replace TEXT [--match-case] [--tab-id ID] [--all | --occurrence N] [--dry-run] [--no-verify] [--preserve-style]
-gw docs insert-text <file_id> --text TEXT --index N [--tab-id ID]
-gw docs insert-table <file_id> --rows N --cols N [--index N] [--tab-id ID]
-gw docs create-table <file_id> --data JSON [--index N] [--bold-headers] [--tab-id ID]
+gw docs insert-text <file_id> --text TEXT --index N [--tab-id ID] [--dry-run]
+gw docs insert-table <file_id> --rows N --cols N [--index N] [--tab-id ID] [--dry-run]
+gw docs create-table <file_id> --data JSON [--index N] [--bold-headers] [--tab-id ID] [--dry-run]
 gw docs insert-image <file_id> --url URL [--index N] [--width N] [--height N] [--tab-id ID]
-gw docs insert-list <file_id> --items JSON [--index N] [--ordered] [--tab-id ID]
-gw docs insert-markdown <file_id> --file PATH | --content STRING [--tab-id ID] [--index N] [--replace]
-gw docs append-markdown <file_id> --file PATH | --stdin | --content STRING [--tab-id ID] [--index N]
-gw docs replace-markdown <file_id> --file PATH | --stdin | --content STRING [--tab-id ID] [--preserve-comments] [--dry-run]
+gw docs insert-list <file_id> --items JSON [--index N] [--ordered] [--tab-id ID] [--dry-run]
+gw docs insert-markdown <file_id> --file PATH | --content STRING [--tab-id ID] [--index N] [--replace] [--dry-run]
+gw docs append-markdown <file_id> --file PATH | --stdin | --content STRING [--tab-id ID] [--index N] [--dry-run]
+gw docs replace-markdown <file_id> --file PATH | --stdin | --content STRING [--tab-id ID] [--force-full [--yes]] [--dry-run]
 gw docs insert-page-break <file_id> [--index N] [--tab-id ID]
 gw docs insert-section-break <file_id> [--index N] [--type NEXT_PAGE|CONTINUOUS] [--tab-id ID]
 gw docs insert-footnote <file_id> --index N --text TEXT [--tab-id ID]
 gw docs delete-object <file_id> --object-id ID
-gw docs update-paragraph-style <file_id> --start N --end N [style flags]
+gw docs update-paragraph-style <file_id> --start N --end N [style flags] [--dry-run]
 gw docs update-document-style <file_id> [margin/page/font flags]
 gw docs manage-named-range <file_id> --action create|delete --name NAME [--start N --end N]
-gw docs manage-table <file_id> --action ACTION --table-index N [flags]
+gw docs manage-table <file_id> --action ACTION --table-index N [flags] [--dry-run]
 gw docs debug-table <file_id> --table-index N
 gw docs list-tables <file_id> [--tab-id ID]
 gw docs table-write <file_id> --table-index N --data JSON [--tab-id ID] [--expected-fingerprint HASH] [--dry-run] [--no-verify] [--bold-headers]
 gw docs set-table-column-widths <file_id> --table-index N --widths "W1,W2,..." [--unit PT] [--tab-id ID] [--expected-fingerprint HASH] [--dry-run]
 gw docs table-wrap-estimate <file_id> --table-index N [--widths "W1,W2,..."] [--font-size PT] [--tab-id ID]
-gw docs batch-update <file_id> --requests JSON [--tab-id ID]
+gw docs batch-update <file_id> --requests JSON [--tab-id ID] [--dry-run]
 gw docs header-footer <file_id> --action get|create|delete [--type header|footer] [--content TEXT]
 gw docs export-pdf <file_id> [--output PATH] [--folder-id ID]
 ```
@@ -237,38 +280,54 @@ blocks, raw HTML.
 
 ##### `replace-markdown` on docs with reviewer comments
 
-`gw docs replace-markdown` clears the target and re-inserts the rendered
-markdown. By **default** that's a full clear-and-reinsert: any comment
-anchored to text inside the cleared range detaches, because the Docs API has
-no way to re-anchor a comment once its quoted text has been deleted and
-recreated (the comment survives, but loses its pinned location).
-
-Pass `--preserve-comments` to avoid that on a doc with reviewer comments:
+`gw docs replace-markdown` defaults to a **surgical** diff mode: it reads the
+current body as a paragraph/table sequence, renders the new markdown into
+the same kind of sequence, and diffs the two with `difflib.SequenceMatcher`
+on normalized paragraph text. Only the paragraphs/tables that actually
+changed are deleted and re-inserted (from the end of the doc backwards, so
+earlier indices stay valid); everything that matches exactly is left
+untouched, so comments anchored to it stay anchored. A table whose
+dimensions are unchanged gets its changed cells rewritten in place (reusing
+the same logic as `table-write`) instead of being replaced outright. A
+changed paragraph that contains a pending suggestion (detected via
+`suggestedInsertionIds`/`suggestedDeletionIds` on its text runs) is left
+untouched rather than silently dropping the suggestion, and shows up under
+`skipped_pending_suggestions` in the output.
 
 ```bash
-gw docs replace-markdown <file_id> --file ./brief.md --preserve-comments
-gw docs replace-markdown <file_id> --file ./brief.md --preserve-comments --dry-run
+gw docs replace-markdown <file_id> --file ./brief.md --dry-run
+gw docs replace-markdown <file_id> --file ./brief.md
 ```
 
-This reads the current body as a paragraph/table sequence, renders the new
-markdown into the same kind of sequence, and diffs the two with
-`difflib.SequenceMatcher` on normalized paragraph text. Only the
-paragraphs/tables that actually changed are deleted and re-inserted (from the
-end of the doc backwards, so earlier indices stay valid); everything that
-matches exactly is left untouched, so comments anchored to it stay anchored.
-A table whose dimensions are unchanged gets its changed cells rewritten in
-place (reusing the same logic as `table-write`) instead of being replaced
-outright. Use `--dry-run` first to see the planned diff (which
-paragraphs/tables are equal/replaced/inserted/deleted) without writing.
+Use `--dry-run` first to see the planned diff (which paragraphs/tables are
+equal/replaced/inserted/deleted, and which would be skipped for a pending
+suggestion) without writing.
+
+Pass `--force-full` to fall back to the old clear-and-reinsert behavior
+(clears the whole target and re-inserts, in one shot -- faster, but any
+comment anchored to text inside the cleared range detaches, because the
+Docs API has no way to re-anchor a comment once its quoted text has been
+deleted and recreated, and any pending suggestion inside the cleared range
+is discarded outright). `--force-full` additionally requires `--yes`
+whenever the doc has unresolved comments anchored to text, pending
+suggestions, or was last modified by someone other than you:
+
+```bash
+gw docs replace-markdown <file_id> --file ./brief.md --force-full
+# -> refused with a reason if there are anchored comments/suggestions/another editor
+
+gw docs replace-markdown <file_id> --file ./brief.md --force-full --yes
+```
 
 Regardless of mode, if the doc has open (unresolved) comments anchored to
 text, the command's JSON output always includes a `warnings` entry telling
-you how many are at risk — read it before trusting a full replace on a
-shared draft.
+you how many are at risk.
 
-Known limitation: the diff key is normalized *text only* (not style), so a
+Known limitations: the diff key is normalized *text only* (not style), so a
 paragraph whose text is unchanged but whose formatting changed (e.g.
-promoted to a heading) is left as-is rather than restyled.
+promoted to a heading) is left as-is rather than restyled; and the
+pending-suggestion skip only inspects paragraph text runs, not suggestions
+inside table cells.
 
 #### Tables: inspect, write, set widths, preview wrapping
 
