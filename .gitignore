@@ -32,3 +32,6 @@ mcp_server_debug.log
 
 # Local scratch data (never commit; this repo is public)
 scratch/
+
+# ---- Git worktrees -----------------------------------------------------
+.worktrees/
