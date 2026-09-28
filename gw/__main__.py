@@ -12,6 +12,7 @@ import sys
 
 from gw.cli import gmail, drive, docs, sheets, calendar, forms, slides, comments, api
 from gw import throttle
+from gw.cli import docs_collab
 
 
 def _subparser_choices(parser):
@@ -153,6 +154,7 @@ def main():
     slides.register(subparsers)
     comments.register(subparsers)
     api.register(subparsers)
+    docs_collab.register(subparsers)  # after docs + comments: extends both
 
     argv = sys.argv[1:]
     root_choices = _subparser_choices(parser)
