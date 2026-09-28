@@ -267,3 +267,14 @@ def test_load_snapshot_refs(tmp_path, monkeypatch):
     assert dc.load_snapshot("D", "r1")["snapshot"] == "20260101T000000Z"
     with pytest.raises(FileNotFoundError):
         dc.load_snapshot("D", "nope")
+
+
+def test_sentence_case_keeps_proper_nouns():
+    # "Glints" is not a common heading word, so it keeps its capital.
+    assert dc.sentence_case("Glints Revenue Update") == "Glints revenue update"
+    assert dc.sentence_case("Next Steps For Glints In Jakarta") == "Next steps for Glints in Jakarta"
+
+
+def test_sentence_case_keep_list():
+    assert dc.sentence_case("Review Plan", keep=["plan"]) == "Review Plan"
+    assert dc.sentence_case("GLINTS REVENUE UPDATE", keep=["glints"]) == "Glints revenue update"

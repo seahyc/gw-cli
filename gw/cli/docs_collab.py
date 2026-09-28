@@ -64,6 +64,7 @@ def cmd_changes(args):
 def cmd_export(args):
     result = svc.export_doc(
         get_service("docs"), args.file_id, args.format, suggestions=args.suggestions,
+        keep_case=[w.strip() for w in (args.keep_case or "").split(",") if w.strip()],
     )
     if args.out:
         out = Path(args.out).expanduser()
@@ -125,6 +126,11 @@ def register(subparsers):
         "without pending suggestions)",
     )
     p.add_argument("--out", help="Write the content to this path instead of the JSON payload")
+    p.add_argument(
+        "--keep-case",
+        help="Comma-separated words email-html heading sentence-casing must never "
+        "change (only common Title Case words are lowercased by default)",
+    )
     p.set_defaults(func=cmd_export)
 
     # Upgrade `gw comments list` in place.

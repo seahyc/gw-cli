@@ -719,25 +719,56 @@ _MUTED = "#6b7280"
 _BORDER = "#d1d5db"
 
 
-def sentence_case(text: str) -> str:
-    """Sentence-case a heading while keeping acronyms and mixed-case words.
+# Title Case words that sentence_case() may lowercase. Anything not listed is
+# left alone, so proper nouns ("Glints", "Jakarta") keep their capital; an
+# unlisted common word staying capitalised is the cheaper mistake.
+COMMON_HEADING_WORDS = frozenset("""
+a about above across after against all also an and any are as at be before
+below between both but by can do does down during each few for from further
+has have how if in into is it its more most new next no not of off on once
+only or other our out over own per same should so some such than that the
+their them then there these they this those through to too under until up
+very via was we were what when where which while who why will with within
+without you your
+action actions analysis approach area areas background budget changes
+context cost costs data decision decisions design details goal goals growth
+impact issue issues items key launch metrics model notes open options
+overview plan plans priorities process progress proposal questions quarter
+quarterly recap recommendation recommendations report results review
+revenue risk risks roadmap scope status step steps strategy summary target
+targets team timeline update updates week weekly work year
+""".split())
+
+
+def sentence_case(text: str, keep=()) -> str:
+    """Sentence-case a heading while keeping acronyms, mixed case and proper nouns.
 
     "QUARTERLY REVENUE UPDATE" -> "Quarterly revenue update"
     "Next Steps For The API"   -> "Next steps for the API"
+    "Why Glints Wins In Jakarta" -> "Why Glints wins in Jakarta" only if "wins"
+    were listed; unlisted Title Case words (likely names) are kept as written.
+
+    Only Title Case words found in COMMON_HEADING_WORDS are lowercased; words in
+    `keep` (case-insensitive) are never changed. An ALL-CAPS heading is
+    lowercased wholesale apart from `keep` words, which get Title Case.
     """
+    keep_lower = {k.lower() for k in keep or ()}
     words = text.split(" ")
     letters = [ch for ch in text if ch.isalpha()]
     all_caps = bool(letters) and all(ch.isupper() for ch in letters)
     out = []
-    for i, w in enumerate(words):
-        if not w:
+    for w in words:
+        core = w.strip(".,:;!?()[]\"'")
+        if not w or core.lower() in keep_lower:
+            if all_caps and w:
+                w = w[:1] + w[1:].lower()
             out.append(w)
             continue
         if all_caps:
             w = w.lower()
-        elif w[:1].isupper() and w[1:].islower():
+        elif core[:1].isupper() and core[1:].islower() and core.lower() in COMMON_HEADING_WORDS:
             w = w.lower()
-        # else: acronym (API) or mixed case (iPhone, GitHub) -> keep
+        # else: acronym (API), mixed case (iPhone), or likely proper noun -> keep
         out.append(w)
     s = " ".join(out)
     for i, ch in enumerate(s):
@@ -808,7 +839,7 @@ def _html_table(block: dict) -> str:
     return "".join(parts)
 
 
-def render_email_html(blocks: list) -> str:
+def render_email_html(blocks: list, keep_case=()) -> str:
     """Outlook-safe HTML fragment: inline styles only, no <style> blocks."""
     p_style = (
         f"margin:0 0 12px 0;font-family:{FONT_STACK};font-size:14px;"
@@ -846,10 +877,10 @@ def render_email_html(blocks: list) -> str:
         elif not b["text"].strip():
             continue
         elif b["heading_level"]:
-            runs = _sentence_case_runs([{**r, "bold": False} for r in b["runs"]])
+            runs = _sentence_case_runs([{**r, "bold": False} for r in b["runs"]], keep_case)
             body.append(_html_heading(_html_inline(runs), b["heading_level"]))
         elif is_bold_only(b):
-            runs = _sentence_case_runs([{**r, "bold": False} for r in b["runs"]])
+            runs = _sentence_case_runs([{**r, "bold": False} for r in b["runs"]], keep_case)
             body.append(_html_heading(_html_inline(runs), 3))
         elif is_italic_only(b):
             runs = [{**r, "italic": False} for r in b["runs"]]
@@ -864,10 +895,10 @@ def render_email_html(blocks: list) -> str:
     )
 
 
-def _sentence_case_runs(runs: list) -> list:
+def _sentence_case_runs(runs: list, keep_case=()) -> list:
     """Sentence-case the heading text; collapses runs when formatting is uniform."""
     text = "".join(r["text"] for r in runs)
-    cased = sentence_case(text)
+    cased = sentence_case(text, keep_case)
     if len(cased) != len(text):
         return runs
     out, pos = [], 0
@@ -970,7 +1001,9 @@ def list_suggestions(docs_service, doc_id: str) -> dict:
     }
 
 
-def export_doc(docs_service, doc_id: str, fmt: str, suggestions: str = "rejected") -> dict:
+def export_doc(
+    docs_service, doc_id: str, fmt: str, suggestions: str = "rejected", keep_case=(),
+) -> dict:
     doc_id = parse_doc_id(doc_id)
     doc = fetch_doc(docs_service, doc_id, suggestions)
     blocks = extract_blocks(doc)
@@ -979,7 +1012,7 @@ def export_doc(docs_service, doc_id: str, fmt: str, suggestions: str = "rejected
     elif fmt == "text":
         content = render_text(blocks)
     elif fmt == "email-html":
-        content = render_email_html(blocks)
+        content = render_email_html(blocks, keep_case)
     else:
         raise ValueError(f"Unknown format: {fmt}")
     return {
