@@ -9,7 +9,10 @@ import json
 import logging
 import os
 import sys
+import stat
+import tempfile
 import webbrowser
+from pathlib import Path
 
 # Google may return a superset of the requested scopes when the account has
 # previously granted this OAuth client extra scopes (e.g. pubsub, cloud-platform
@@ -200,14 +203,14 @@ def _credentials_from_json(creds_json):
     except (json.JSONDecodeError, TypeError):
         return None
 
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     expiry = None
     if creds_data.get("expiry"):
         try:
             expiry = datetime.fromisoformat(creds_data["expiry"])
             if expiry.tzinfo is not None:
-                expiry = expiry.replace(tzinfo=None)
+                expiry = expiry.astimezone(timezone.utc).replace(tzinfo=None)
         except (ValueError, TypeError):
             pass
 
@@ -222,12 +225,90 @@ def _credentials_from_json(creds_json):
     )
 
 
+FILE_AUTH_SCOPES = [
+    "openid", "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/drive.file",
+]
+
+
+class CredentialFileError(AccountError):
+    """Unattended credentials require explicit repair, never implicit OAuth."""
+
+
+def _file_path():
+    value = os.environ.get("GW_CREDENTIALS_FILE")
+    return Path(value).expanduser() if value else None
+
+
+def _file_error(path, problem):
+    return CredentialFileError(
+        f"Credential file {path}: {problem}. Reauthorize explicitly with "
+        f"gw auth login --credential-file {path} --print-url"
+    )
+
+
+def _load_credential_file(path):
+    path = Path(path).expanduser()
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd) as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+                raise _file_error(path, "must be a regular file with permissions 0600")
+            if info.st_uid != os.getuid():
+                raise _file_error(path, "must be owned by the current user")
+            data = json.load(stream)
+        required = ("token", "refresh_token", "client_id", "client_secret", "token_uri", "email", "expiry")
+        if not isinstance(data, dict) or any(not isinstance(data.get(k), str) or not data[k] for k in required):
+            raise _file_error(path, "missing authorized-user credential fields")
+        if not isinstance(data.get("scopes"), list) or not data["scopes"] or any(not isinstance(scope, str) for scope in data["scopes"]):
+            raise _file_error(path, "missing granted scopes")
+        from datetime import datetime
+        datetime.fromisoformat(data["expiry"].replace("Z", "+00:00"))
+        credentials = _credentials_from_json(json.dumps(data))
+        return credentials, data["email"]
+    except CredentialFileError:
+        raise
+    except (OSError, ValueError, TypeError):
+        raise _file_error(path, "missing or invalid credential file") from None
+
+
+def _save_credential_file(path, user_email, credentials):
+    path = Path(path).expanduser()
+    granted = credentials.granted_scopes or credentials.scopes or []
+    data = {
+        "type": "authorized_user",
+        "token": credentials.token, "refresh_token": credentials.refresh_token,
+        "client_id": credentials.client_id, "client_secret": credentials.client_secret,
+        "token_uri": credentials.token_uri, "scopes": list(granted),
+        "expiry": credentials.expiry.isoformat() if credentials.expiry else None,
+        "email": user_email,
+    }
+    temp_name = None
+    try:
+        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        with os.fdopen(fd, "w") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            json.dump(data, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_name, path)
+    except OSError:
+        raise _file_error(path, "could not persist credentials") from None
+    finally:
+        if temp_name and os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
 def _load_credentials(account=None):
     """Load credentials from macOS Keychain for `account` (email or alias).
 
     With no account, uses the process-selected account (--account/GW_ACCOUNT)
     or else the stored default (first registered user if none was chosen).
     """
+    path = _file_path()
+    if path:
+        return _load_credential_file(path)
     keyring = _get_keychain_store()
     user_email = resolve_account(account or _selected_account_name(), keyring)
     if not user_email:
@@ -282,14 +363,28 @@ def _record_login_target(user_email, requested):
     keyring.set_password(KEYCHAIN_SERVICE, _ALIASES_KEY, json.dumps(aliases, sort_keys=True))
 
 
-def _finalize_credentials(credentials, requested_account=None):
+def _finalize_credentials(credentials, requested_account=None, credential_file=None, requested_scopes=None):
     """Fetch the user's email for freshly-minted credentials and persist them."""
     service = build("oauth2", "v2", credentials=credentials)
     user_info = service.userinfo().get().execute()
     user_email = user_info.get("email", "unknown")
 
-    _save_credentials(user_email, credentials)
-    _record_login_target(user_email, requested_account)
+    if credential_file:
+        granted = set(credentials.granted_scopes or credentials.scopes or [])
+        if not set(requested_scopes or FILE_AUTH_SCOPES).issubset(granted):
+            raise _file_error(credential_file, "Google did not grant all requested scopes")
+        if not credentials.refresh_token:
+            raise _file_error(credential_file, "Google did not return an offline refresh token")
+        if requested_account and "@" in requested_account and requested_account.lower() != user_email.lower():
+            raise _file_error(credential_file, "Google account does not match the requested email")
+        _save_credential_file(credential_file, user_email, credentials)
+        print("Granted scopes: " + ", ".join(sorted(granted)), file=sys.stderr)
+        extra = granted - set(requested_scopes or FILE_AUTH_SCOPES)
+        if extra:
+            print("Warning: Google returned additional previously authorized scopes: " + ", ".join(sorted(extra)), file=sys.stderr)
+    else:
+        _save_credentials(user_email, credentials)
+        _record_login_target(user_email, requested_account)
 
     print(f"Authenticated as {user_email}", file=sys.stderr)
     return credentials, user_email
@@ -308,27 +403,38 @@ def _login_hint_kwargs(account):
     return {}
 
 
-def _run_oauth_flow(account=None):
+def _run_oauth_flow(account=None, credential_file=None, scopes=None, open_browser=True):
     """Run the OAuth flow to get new credentials."""
     from google_auth_oauthlib.flow import InstalledAppFlow
 
     client_config = _get_client_config()
 
-    flow = InstalledAppFlow.from_client_config(client_config, scopes=ALL_SCOPES)
+    requested_scopes = scopes or (FILE_AUTH_SCOPES if credential_file else ALL_SCOPES)
+    if credential_file:
+        requested_scopes = list(dict.fromkeys(["openid", "https://www.googleapis.com/auth/userinfo.email", *requested_scopes]))
+    flow = InstalledAppFlow.from_client_config(client_config, scopes=requested_scopes)
 
-    print("Opening browser for Google authentication...", file=sys.stderr)
+    print("Waiting for Google authentication...", file=sys.stderr)
     # Try ports in sequence to avoid conflicts
     for port in [8080, 8090, 9090, 0]:
         try:
             credentials = flow.run_local_server(
-                port=port, open_browser=True, **_login_hint_kwargs(account)
+                port=port, open_browser=open_browser, prompt="consent",
+                authorization_prompt_message="Authorize Google access at: {url}",
+                **_login_hint_kwargs(account)
             )
             break
         except OSError:
             if port == 0:
                 raise
             continue
+        except Exception:
+            if credential_file:
+                raise _file_error(credential_file, "OAuth authorization failed") from None
+            raise
 
+    if credential_file:
+        return _finalize_credentials(credentials, requested_account=account, credential_file=credential_file, requested_scopes=requested_scopes)
     return _finalize_credentials(credentials, requested_account=account)
 
 
@@ -376,7 +482,21 @@ def exchange_manual_response(flow, redirect_response, account=None):
 def get_credentials():
     """Get valid credentials for the selected account, running OAuth if needed."""
     requested = _selected_account_name()
+    path = _file_path()
     credentials, user_email = _load_credentials()
+    if path:
+        if credentials.valid:
+            return credentials, user_email
+        if not credentials.refresh_token:
+            raise _file_error(path, "missing refresh token")
+        try:
+            credentials.refresh(Request())
+        except Exception:
+            raise _file_error(path, "refresh failed or grant expired") from None
+        if not credentials.valid:
+            raise _file_error(path, "refresh did not return valid credentials")
+        _save_credential_file(path, user_email, credentials)
+        return credentials, user_email
 
     if credentials and credentials.valid:
         return credentials, user_email
@@ -396,6 +516,8 @@ def get_credentials():
 def current_account():
     """Email of the account whose credentials this process uses (no OAuth)."""
     try:
+        if _file_path():
+            return _load_credential_file(_file_path())[1]
         return resolve_account(_selected_account_name())
     except AccountError:
         return None
@@ -521,10 +643,21 @@ def auth_use(account):
     return {"default": email, "summary": f"Default account is now {email}"}
 
 
-def auth_login(account=None):
+def auth_login(account=None, credential_file=None, scopes=None, open_browser=True):
     """Force re-authentication (optionally for a specific account or alias)."""
-    credentials, user_email = _run_oauth_flow(account=account or _selected_account_name())
-    return {"authenticated": True, "user": user_email, "account": user_email}
+    selected = account or _selected_account_name()
+    credential_file = credential_file or _file_path()
+    if credential_file or scopes or not open_browser:
+        if scopes and not credential_file:
+            raise AccountError("--scope requires --credential-file; Keychain login keeps its existing defaults")
+        credentials, user_email = _run_oauth_flow(account=selected, credential_file=credential_file, scopes=scopes, open_browser=open_browser)
+    else:
+        credentials, user_email = _run_oauth_flow(account=selected)
+    result = {"authenticated": True, "user": user_email, "account": user_email}
+    if credential_file:
+        result["credential_file"] = str(Path(credential_file).expanduser())
+        result["scopes"] = list(credentials.granted_scopes or credentials.scopes or [])
+    return result
 
 
 def auth_login_manual(account=None):

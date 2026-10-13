@@ -180,6 +180,9 @@ def main():
         "--account",
         help="Email to log in as, or an alias to attach to whichever account signs in",
     )
+    login_parser.add_argument("--credential-file", help="Save dedicated 0600 authorized-user credentials without modifying Keychain")
+    login_parser.add_argument("--scope", action="append", help="Requested OAuth scope (repeatable; credential-file mode only)")
+    login_parser.add_argument("--print-url", action="store_true", help="Print consent URL and wait for loopback callback without opening a browser")
     auth_sub.add_parser("status", help="Show authentication status")
     auth_sub.add_parser("list", help="List logged-in accounts, aliases and the default")
     use_parser = auth_sub.add_parser("use", help="Set the default account")
@@ -227,9 +230,14 @@ def main():
         try:
             if args.action == "login":
                 if getattr(args, "manual", False):
+                    if args.credential_file or args.scope or args.print_url:
+                        raise AccountError("Use --print-url with --credential-file for unattended credentials; --manual uses Keychain")
                     success(auth_login_manual(account))
                 else:
-                    success(auth_login(account))
+                    if args.credential_file or args.scope or args.print_url:
+                        success(auth_login(account, credential_file=args.credential_file, scopes=args.scope, open_browser=not args.print_url))
+                    else:
+                        success(auth_login(account))
             elif args.action == "status":
                 success(auth_status())
             elif args.action == "list":

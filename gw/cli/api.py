@@ -13,6 +13,9 @@ without a second, separately-authenticated CLI.
 """
 
 import json
+import os
+import tempfile
+from pathlib import Path
 
 from gw.auth import SERVICE_VERSIONS, get_credentials
 from gw.output import success, error
@@ -29,6 +32,7 @@ def register(subparsers):
     parser.add_argument("--version", help="API version override (default: gw's standard version for the service)")
     parser.add_argument("--params", help="JSON object of keyword arguments for the method call")
     parser.add_argument("--body", help="JSON object to pass as the method's 'body' argument")
+    parser.add_argument("--output", help="Atomically save a binary API response to this path")
     parser.add_argument("--dry-run", action="store_true", help="Print the resolved call without executing it")
     parser.set_defaults(func=cmd_api)
 
@@ -78,7 +82,25 @@ def cmd_api(args):
         resource = _resolve_resource(service, args.resource)
         method = getattr(resource, args.method)
         result = method(**params).execute()
-        success(json.dumps(result, indent=2, default=str))
+        if getattr(args, "output", None):
+            if not isinstance(result, bytes):
+                error("--output requires a binary API response")
+                return
+            path = Path(args.output).expanduser().absolute()
+            temporary = None
+            try:
+                fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(result)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+            finally:
+                if temporary and os.path.exists(temporary):
+                    os.unlink(temporary)
+            success({"path": str(path), "size_bytes": len(result)})
+        else:
+            success(json.dumps(result, indent=2, default=str))
     except json.JSONDecodeError as e:
         error(f"Invalid JSON in --params/--body: {e}")
     except AttributeError as e:
