@@ -101,3 +101,30 @@ def test_loopback_print_url_narrow_scopes(tmp_path):
     assert factory.call_args.kwargs["scopes"] == auth.FILE_AUTH_SCOPES
     assert flow.run_local_server.call_args.kwargs["open_browser"] is False
     assert flow.run_local_server.call_args.kwargs["prompt"] == "consent"
+
+
+def test_service_account_file_loads_without_oauth(tmp_path, monkeypatch):
+    import rsa
+    from google.oauth2 import service_account
+    pem = rsa.newkeys(1024)[1].save_pkcs1().decode()
+    path = tmp_path / "sa.json"
+    path.write_text(json.dumps({
+        "type": "service_account", "project_id": "p", "private_key_id": "k", "private_key": pem,
+        "client_email": "bot@p.iam.gserviceaccount.com", "client_id": "1",
+        "token_uri": "https://oauth2.googleapis.com/token"}))
+    path.chmod(0o600)
+    monkeypatch.setenv("GW_CREDENTIALS_FILE", str(path))
+
+    def fake_refresh(self, request):
+        self.token = "sa-token"
+        self.expiry = datetime.utcnow() + timedelta(hours=1)
+
+    with patch.object(service_account.Credentials, "refresh", fake_refresh), \
+         patch.object(auth, "_get_keychain_store", side_effect=AssertionError("no keychain")), \
+         patch.object(auth, "_run_oauth_flow", side_effect=AssertionError("no interactive auth")):
+        loaded, email = auth.get_credentials()
+    assert email == "bot@p.iam.gserviceaccount.com"
+    assert loaded.token == "sa-token"
+    assert set(auth.SERVICE_ACCOUNT_SCOPES) <= set(loaded.scopes)
+    assert auth.current_account() == "bot@p.iam.gserviceaccount.com"
+    assert path.read_text().count("sa-token") == 0

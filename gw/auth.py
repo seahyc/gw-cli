@@ -230,6 +230,14 @@ FILE_AUTH_SCOPES = [
     "https://www.googleapis.com/auth/drive.file",
 ]
 
+# A service account reaches only files shared with its email, so it gets full
+# Drive and Sheets scopes; sharing is the access boundary.
+SERVICE_ACCOUNT_SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/documents",
+]
+
 
 class CredentialFileError(AccountError):
     """Unattended credentials require explicit repair, never implicit OAuth."""
@@ -258,6 +266,10 @@ def _load_credential_file(path):
             if info.st_uid != os.getuid():
                 raise _file_error(path, "must be owned by the current user")
             data = json.load(stream)
+        if isinstance(data, dict) and data.get("type") == "service_account":
+            from google.oauth2 import service_account
+            credentials = service_account.Credentials.from_service_account_info(data, scopes=SERVICE_ACCOUNT_SCOPES)
+            return credentials, data["client_email"]
         required = ("token", "refresh_token", "client_id", "client_secret", "token_uri", "email", "expiry")
         if not isinstance(data, dict) or any(not isinstance(data.get(k), str) or not data[k] for k in required):
             raise _file_error(path, "missing authorized-user credential fields")
@@ -479,6 +491,11 @@ def exchange_manual_response(flow, redirect_response, account=None):
     return _finalize_credentials(flow.credentials, requested_account=account)
 
 
+def _is_service_account(credentials):
+    from google.oauth2 import service_account
+    return isinstance(credentials, service_account.Credentials)
+
+
 def get_credentials():
     """Get valid credentials for the selected account, running OAuth if needed."""
     requested = _selected_account_name()
@@ -486,6 +503,12 @@ def get_credentials():
     credentials, user_email = _load_credentials()
     if path:
         if credentials.valid:
+            return credentials, user_email
+        if _is_service_account(credentials):
+            try:
+                credentials.refresh(Request())
+            except Exception:
+                raise _file_error(path, "service account token request failed") from None
             return credentials, user_email
         if not credentials.refresh_token:
             raise _file_error(path, "missing refresh token")
