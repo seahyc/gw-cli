@@ -128,3 +128,19 @@ def test_service_account_file_loads_without_oauth(tmp_path, monkeypatch):
     assert set(auth.SERVICE_ACCOUNT_SCOPES) <= set(loaded.scopes)
     assert auth.current_account() == "bot@p.iam.gserviceaccount.com"
     assert path.read_text().count("sa-token") == 0
+
+
+def test_readonly_mode_requests_only_read_scopes(tmp_path, monkeypatch):
+    import rsa
+    path = tmp_path / "sa.json"
+    path.write_text(json.dumps({
+        "type": "service_account", "project_id": "p", "private_key_id": "k", "private_key": rsa.newkeys(1024)[1].save_pkcs1().decode(),
+        "client_email": "bot@p.iam.gserviceaccount.com", "client_id": "1", "token_uri": "https://oauth2.googleapis.com/token"}))
+    path.chmod(0o600)
+    monkeypatch.setenv("GW_CREDENTIALS_FILE", str(path))
+    monkeypatch.setenv("GW_READONLY", "1")
+    loaded, _ = auth._load_credential_file(path)
+    assert set(loaded.scopes) == set(auth.READONLY_SCOPES)
+    monkeypatch.setenv("GW_READONLY", "0")
+    loaded, _ = auth._load_credential_file(path)
+    assert set(loaded.scopes) == set(auth.SERVICE_ACCOUNT_SCOPES)
