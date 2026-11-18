@@ -144,3 +144,16 @@ def test_readonly_mode_requests_only_read_scopes(tmp_path, monkeypatch):
     monkeypatch.setenv("GW_READONLY", "0")
     loaded, _ = auth._load_credential_file(path)
     assert set(loaded.scopes) == set(auth.SERVICE_ACCOUNT_SCOPES)
+
+
+def test_readonly_write_error_says_what_to_use_instead(monkeypatch):
+    from unittest.mock import Mock
+    from googleapiclient.errors import HttpError
+    monkeypatch.setenv("GW_READONLY", "1")
+    monkeypatch.setenv("GW_READONLY_MESSAGE", "use sheet_write")
+    cls = auth._readonly_request_class()
+    req = cls.__new__(cls)
+    resp = Mock(status=403, reason="Forbidden")
+    with patch("googleapiclient.http.HttpRequest.execute", side_effect=HttpError(resp, b"insufficient scopes")):
+        with pytest.raises(auth.ReadOnlyError, match="use sheet_write"):
+            req.execute()

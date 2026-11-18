@@ -250,6 +250,37 @@ def _readonly():
     return os.environ.get("GW_READONLY", "").strip().lower() in ("1", "true", "yes")
 
 
+def readonly_message():
+    """What to tell a caller whose write was refused; GW_READONLY_MESSAGE names the right path for that agent."""
+    return os.environ.get("GW_READONLY_MESSAGE", "").strip() or (
+        "gw is read-only here (GW_READONLY=1): this write was refused. Make changes through the write path you "
+        "were given instead."
+    )
+
+
+class ReadOnlyError(PermissionError):
+    """A write attempted with read-only credentials."""
+
+
+def _readonly_request_class():
+    from googleapiclient.errors import HttpError
+    from googleapiclient.http import HttpRequest
+
+    class ReadOnlyRequest(HttpRequest):
+        def execute(self, *args, **kwargs):
+            try:
+                return super().execute(*args, **kwargs)
+            except HttpError as error:
+                if getattr(error.resp, "status", None) == 403:
+                    raise ReadOnlyError(readonly_message()) from error
+                raise
+
+    return ReadOnlyRequest
+
+
+_hinted = False
+
+
 class CredentialFileError(AccountError):
     """Unattended credentials require explicit repair, never implicit OAuth."""
 
@@ -579,6 +610,12 @@ def get_service(service_name, version=None):
             raise ValueError(f"Unknown service: {service_name}. Specify version explicitly.")
 
     credentials, _ = get_credentials()
+    if _readonly():
+        global _hinted
+        if not _hinted:
+            print(f"gw: read-only. {readonly_message()}", file=sys.stderr)
+            _hinted = True
+        return build(service_name, version, credentials=credentials, requestBuilder=_readonly_request_class())
     return build(service_name, version, credentials=credentials)
 
 
