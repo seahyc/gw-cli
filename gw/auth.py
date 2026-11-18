@@ -238,6 +238,17 @@ SERVICE_ACCOUNT_SCOPES = [
     "https://www.googleapis.com/auth/documents",
 ]
 
+# GW_READONLY=1: tokens can read but never change anything, for agents whose writes must go through a checked path.
+READONLY_SCOPES = [
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "https://www.googleapis.com/auth/documents.readonly",
+]
+
+
+def _readonly():
+    return os.environ.get("GW_READONLY", "").strip().lower() in ("1", "true", "yes")
+
 
 class CredentialFileError(AccountError):
     """Unattended credentials require explicit repair, never implicit OAuth."""
@@ -268,7 +279,9 @@ def _load_credential_file(path):
             data = json.load(stream)
         if isinstance(data, dict) and data.get("type") == "service_account":
             from google.oauth2 import service_account
-            credentials = service_account.Credentials.from_service_account_info(data, scopes=SERVICE_ACCOUNT_SCOPES)
+            credentials = service_account.Credentials.from_service_account_info(
+                data, scopes=READONLY_SCOPES if _readonly() else SERVICE_ACCOUNT_SCOPES
+            )
             return credentials, data["client_email"]
         required = ("token", "refresh_token", "client_id", "client_secret", "token_uri", "email", "expiry")
         if not isinstance(data, dict) or any(not isinstance(data.get(k), str) or not data[k] for k in required):
@@ -277,6 +290,9 @@ def _load_credential_file(path):
             raise _file_error(path, "missing granted scopes")
         from datetime import datetime
         datetime.fromisoformat(data["expiry"].replace("Z", "+00:00"))
+        if _readonly():
+            # Drop the stored full-access token: the next refresh asks Google for read-only scopes.
+            data = {**data, "token": None, "scopes": READONLY_SCOPES}
         credentials = _credentials_from_json(json.dumps(data))
         return credentials, data["email"]
     except CredentialFileError:
@@ -518,7 +534,8 @@ def get_credentials():
             raise _file_error(path, "refresh failed or grant expired") from None
         if not credentials.valid:
             raise _file_error(path, "refresh did not return valid credentials")
-        _save_credential_file(path, user_email, credentials)
+        if not _readonly():  # never store a read-only token over the full-access one
+            _save_credential_file(path, user_email, credentials)
         return credentials, user_email
 
     if credentials and credentials.valid:
