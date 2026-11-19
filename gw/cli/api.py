@@ -26,7 +26,7 @@ def register(subparsers):
         "api",
         help="Raw Google API passthrough: gw api <service> <resource> <method> [--params JSON] [--body JSON]",
     )
-    parser.add_argument("api_service", help="Google API service name (drive, docs, sheets, gmail, calendar, forms, slides)")
+    parser.add_argument("api_service", help="Google API service name (drive, docs, sheets, gmail, calendar, forms, slides, script)")
     parser.add_argument("resource", help="Discovery resource path, dot-separated (e.g. 'files', 'comments.replies')")
     parser.add_argument("method", help="Method name on the resource (e.g. 'list', 'get', 'create')")
     parser.add_argument("--version", help="API version override (default: gw's standard version for the service)")

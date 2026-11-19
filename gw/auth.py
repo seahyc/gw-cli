@@ -41,6 +41,7 @@ SERVICE_VERSIONS = {
     "calendar": "v3",
     "forms": "v1",
     "slides": "v1",
+    "script": "v1",
     "oauth2": "v2",
 }
 
@@ -77,6 +78,9 @@ ALL_SCOPES = [
     # Slides
     "https://www.googleapis.com/auth/presentations",
     "https://www.googleapis.com/auth/presentations.readonly",
+    # Apps Script (create and deploy script projects)
+    "https://www.googleapis.com/auth/script.projects",
+    "https://www.googleapis.com/auth/script.deployments",
 ]
 
 
