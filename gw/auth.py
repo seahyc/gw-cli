@@ -81,6 +81,9 @@ ALL_SCOPES = [
     # Apps Script (create and deploy script projects)
     "https://www.googleapis.com/auth/script.projects",
     "https://www.googleapis.com/auth/script.deployments",
+    # Search Console and site ownership verification
+    "https://www.googleapis.com/auth/webmasters",
+    "https://www.googleapis.com/auth/siteverification",
 ]
 
 

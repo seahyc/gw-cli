@@ -133,6 +133,21 @@ def cmd_copy(args):
         error(str(e))
 
 
+def cmd_copy_batch(args):
+    try:
+        from gw.services.drive_bulk import copy_batch
+        result = copy_batch(
+            get_service("drive"), args.manifest, args.checkpoint,
+            batch_size=args.batch_size, max_retries=args.max_retries,
+            batch_delay=args.batch_delay,
+        )
+        success(result)
+        if result["failed"]:
+            raise SystemExit(1)
+    except Exception as e:
+        error(str(e))
+
+
 def cmd_move(args):
     try:
         service = get_service("drive")
@@ -295,6 +310,14 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--name", default=None, help="Name for the copy")
     p.add_argument("--parent", default=None, help="Parent folder ID for the copy")
     p.set_defaults(func=cmd_copy)
+
+    p = drive_sub.add_parser("copy-batch", help="Copy a JSON manifest with a resumable JSONL checkpoint")
+    p.add_argument("manifest", help="JSON list: source_id, parent, name, expected_md5, expected_size")
+    p.add_argument("--checkpoint", required=True, help="Append-only JSONL progress file")
+    p.add_argument("--batch-size", type=int, default=50, help="Copies per batch, 1..100 (default: 50)")
+    p.add_argument("--max-retries", type=int, default=4, help="Retries for per-item HTTP 429/5xx (default: 4)")
+    p.add_argument("--batch-delay", type=float, default=1.0, help="Seconds between batches (default: 1)")
+    p.set_defaults(func=cmd_copy_batch)
 
     # -- move -----------------------------------------------------------------
     p = drive_sub.add_parser("move", help="Move a file to a different folder")
